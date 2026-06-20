@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+
+# Generated news data (built fresh in CI on each deploy)
+public/data/news.json
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea

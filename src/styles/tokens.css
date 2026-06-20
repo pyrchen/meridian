@@ -1,0 +1,76 @@
+/* Meridian design tokens — «обсерватория на рассвете» */
+:root {
+  color-scheme: dark;
+
+  /* поверхности: предрассветный сине-чёрный (не чистый чёрный) */
+  --ink: #090d18;
+  --ink-1: #0d1322;
+  --ink-2: #121a2d;
+  --ink-3: #1a2440;
+  --line: #1b2238;
+  --line-2: #2a3450;
+
+  /* текст */
+  --paper: #e9edf7;
+  --haze: #8d97af;
+  --haze-dim: #5a6280;
+
+  /* акценты */
+  --first-light: #ffb14e; /* звезда пересекает меридиан — основной акцент */
+  --first-light-soft: #ffcf8a;
+  --first-light-glow: rgba(255, 177, 78, 0.16);
+  --star: #6fd0ec; /* холодный интерактивный, редко */
+
+  /* категории — приглушённые, одна семья */
+  --c-crypto: #e6a94b;
+  --c-ai: #b79be0;
+  --c-dev: #74c2a4;
+  --c-business: #84abde;
+
+  /* рынок */
+  --pos: #46d69a;
+  --neg: #ff6b6b;
+
+  /* типографика */
+  --serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+  --sans: 'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* метрики */
+  --maxw: 1180px;
+  --gut: clamp(16px, 4vw, 40px);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow: 0 22px 60px -28px rgba(0, 0, 0, 0.8);
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  --ink: #f4f1e8;
+  --ink-1: #efebe0;
+  --ink-2: #ffffff;
+  --ink-3: #f3efe4;
+  --line: #e2dccb;
+  --line-2: #d2cab4;
+
+  --paper: #1a1f2b;
+  --haze: #5b6275;
+  --haze-dim: #8a8f9e;
+
+  --first-light: #c97a17;
+  --first-light-soft: #b56a0e;
+  --first-light-glow: rgba(201, 122, 23, 0.12);
+  --star: #1d7fa0;
+
+  --c-crypto: #b07d22;
+  --c-ai: #7a5bb0;
+  --c-dev: #2f8a68;
+  --c-business: #3a6db0;
+
+  --pos: #138a5e;
+  --neg: #c4453f;
+
+  --shadow: 0 22px 50px -30px rgba(60, 50, 20, 0.35);
+}

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Meridian — утренний дайджест мира</title>
+    <meta
+      name="description"
+      content="Самые значимые новости мира за утро: крипта, ИИ, разработка, бизнес. Без логина, ранжировано по числу источников. Поставь как приложение и читай офлайн."
+    />
+    <meta name="theme-color" content="#090d18" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- тема до отрисовки, чтобы не моргало -->
+    <script>
+      try {
+        const t = localStorage.getItem('meridian-theme');
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <header class="masthead">
+      <div class="wrap masthead__row">
+        <a class="brand" href="./" aria-label="Meridian — на главную">
+          MERI<span class="brand__tick"></span><span class="brand__star"></span>DIAN
+        </a>
+        <div class="tools">
+          <button class="icon-btn" id="refresh" title="Обновить" aria-label="Обновить ленту">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button class="icon-btn" id="theme" title="Тема" aria-label="Переключить тему">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero wrap" aria-labelledby="greet">
+        <h1 class="hero__greet" id="greet">Меридиан<em>.</em></h1>
+        <div class="hero__meta">
+          <span class="read" id="today">—</span>
+          <span class="dot"></span>
+          <span class="clock" id="clock">◷ <b>--:--</b></span>
+          <span class="dot"></span>
+          <span class="read" id="tally">загрузка…</span>
+        </div>
+
+        <a class="lede" id="lede" href="#" target="_blank" rel="noopener" hidden>
+          <div class="lede__body">
+            <div class="lede__eyebrow">
+              <span class="chip" id="lede-chip">—</span>
+              <span class="transit" id="lede-transit" aria-hidden="true"></span>
+            </div>
+            <div class="lede__title" id="lede-title"></div>
+            <p class="lede__sum" id="lede-sum"></p>
+            <div class="lede__foot">
+              <span class="src" id="lede-src"></span>
+              <span class="ago" id="lede-ago"></span>
+            </div>
+          </div>
+          <div class="lede__media">
+            <img id="lede-img" alt="" loading="lazy" />
+          </div>
+        </a>
+      </section>
+
+      <nav class="filters" aria-label="Категории">
+        <div class="wrap filters__row" id="tabs" role="tablist"></div>
+      </nav>
+
+      <section class="feed wrap" aria-live="polite">
+        <div class="grid" id="grid"></div>
+        <div class="state" id="state" hidden></div>
+      </section>
+    </main>
+
+    <footer class="foot wrap">
+      <span
+        >Meridian · собирает значимое из <span id="src-count">—</span> источников ·
+        ранжирование по числу источников и свежести</span
+      >
+      <span>обновлено <span id="updated">—</span> · <a id="arb-link" href="./arbitrage.html">терминал</a></span>
+    </footer>
+
+    <script type="module" src="/src/news/main.ts"></script>
+  </body>
+</html>

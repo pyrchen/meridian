@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Meridian · Терминал</title>
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#090d18" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:wght@500;600&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      try {
+        const t = localStorage.getItem('meridian-theme');
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <!-- Замок доступа (клиентский — см. примечание в README) -->
+    <div class="gate" id="gate">
+      <div class="gate__card">
+        <svg class="gate__mark" viewBox="0 0 64 64" aria-hidden="true">
+          <circle cx="32" cy="34" r="18" fill="none" stroke="#2a3450" stroke-width="2.4" />
+          <line x1="32" y1="8" x2="32" y2="58" stroke="#ffb14e" stroke-width="2.4" />
+          <circle cx="32" cy="15" r="4.2" fill="#ffb14e" />
+        </svg>
+        <h1>Терминал</h1>
+        <p>Приватный арбитражный сканер. Введи код доступа.</p>
+        <form id="gate-form">
+          <input
+            type="password"
+            id="gate-pass"
+            placeholder="код доступа"
+            autocomplete="current-password"
+            aria-label="Код доступа"
+          />
+          <button type="submit">Войти</button>
+        </form>
+        <div class="gate__err" id="gate-err"></div>
+      </div>
+    </div>
+
+    <main class="term" id="term" hidden>
+      <header class="term__bar">
+        <div class="wrap term__bar-row">
+          <div class="term__title">
+            MERI<span class="brand__tick"></span>DIAN · Терминал
+          </div>
+          <span class="live" id="live">
+            <span class="live__dot"></span><span id="live-text">подключение…</span>
+          </span>
+          <a class="term__back" href="./">← к новостям</a>
+        </div>
+      </header>
+
+      <div class="wrap">
+        <div class="controls">
+          <div class="ctl">
+            <label for="fee">Комиссия, % / сторону</label>
+            <input type="number" id="fee" value="0.1" step="0.01" min="0" />
+          </div>
+          <div class="ctl">
+            <label for="min">Мин. спред, %</label>
+            <input type="number" id="min" value="0.5" step="0.1" min="0" />
+          </div>
+          <div class="ctl">
+            <label for="max">Макс. спред, %</label>
+            <input type="number" id="max" value="50" step="1" min="0" />
+          </div>
+          <div class="ctl">
+            <label>Биржи</label>
+            <div class="exs" id="exs"></div>
+          </div>
+          <div class="ctl">
+            <label for="auto">Авто-обновление</label>
+            <input type="checkbox" id="auto" checked />
+          </div>
+          <button class="btn btn--primary" id="scan">Сканировать</button>
+        </div>
+
+        <div class="stats">
+          <div class="stat"><b id="s-pairs">—</b><span>пар сверено</span></div>
+          <div class="stat good"><b id="s-opps">—</b><span>возможностей</span></div>
+          <div class="stat"><b id="s-best">—</b><span>лучший нетто</span></div>
+          <div class="stat"><b id="s-ex">—</b><span>бирж онлайн</span></div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="arb">
+            <thead>
+              <tr>
+                <th>Монета</th>
+                <th>Купить (ask)</th>
+                <th>Продать (bid)</th>
+                <th>Спред</th>
+                <th>Нетто</th>
+                <th>Бирж</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div class="term__empty" id="term-empty" hidden></div>
+
+        <div class="disclaimer">
+          <b>Это не финансовый совет.</b> Спред между биржами ≠ гарантированная
+          прибыль. Учитывай: комиссии тейкера и за вывод, время и риск перевода
+          между биржами, проскальзывание и реальную ликвидность стакана,
+          приостановку ввода/вывода монеты, возможный делистинг. Аномально большой
+          спред (десятки %) — почти всегда «мёртвая» или замороженная пара, а не
+          возможность. Сканер сверяет лучшие bid/ask по USDT-парам на биржах с
+          открытым браузерным CORS (Binance, Bybit, OKX, Bitget; HTX — если
+          доступна с твоего адреса).
+        </div>
+      </div>
+    </main>
+
+    <script type="module" src="/src/arb/main.ts"></script>
+  </body>
+</html>

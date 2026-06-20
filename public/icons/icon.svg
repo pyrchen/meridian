@@ -1,0 +1,26 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Meridian">
+  <defs>
+    <linearGradient id="meridian" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb14e" stop-opacity="0"/>
+      <stop offset="0.18" stop-color="#ffb14e" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#ffcf8a"/>
+      <stop offset="0.82" stop-color="#ffb14e" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#ffb14e" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="dawn" cx="50%" cy="24%" r="55%">
+      <stop offset="0" stop-color="#ffb14e" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ffb14e" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="#090d18"/>
+  <rect width="512" height="512" fill="url(#dawn)"/>
+  <!-- меридианное кольцо -->
+  <circle cx="256" cy="268" r="146" fill="none" stroke="#26314e" stroke-width="13"/>
+  <!-- линия горизонта -->
+  <line x1="120" y1="268" x2="392" y2="268" stroke="#1b2238" stroke-width="9" stroke-linecap="round"/>
+  <!-- меридиан -->
+  <line x1="256" y1="70" x2="256" y2="466" stroke="url(#meridian)" stroke-width="7"/>
+  <!-- звезда пересекает меридиан -->
+  <circle cx="256" cy="122" r="34" fill="url(#dawn)"/>
+  <circle cx="256" cy="122" r="17" fill="#ffb14e"/>
+</svg>

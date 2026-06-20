@@ -48,7 +48,6 @@
   { "category": "business", "name": "The Guardian", "url": "https://www.theguardian.com/uk/business/rss", "weight": 7, "lang": "en" },
   { "category": "business", "name": "Forbes", "url": "https://www.forbes.com/business/feed/", "weight": 7, "lang": "en" },
   { "category": "business", "name": "Forbes.ru", "url": "https://www.forbes.ru/newrss.xml", "weight": 8, "lang": "ru" },
-  { "category": "business", "name": "Ведомости — Экономика", "url": "https://www.vedomosti.ru/rss/rubric/economics", "weight": 7, "lang": "ru" },
-  { "category": "business", "name": "РБК", "url": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "weight": 6, "lang": "ru" },
-  { "category": "business", "name": "Коммерсантъ", "url": "https://www.kommersant.ru/RSS/news.xml", "weight": 5, "lang": "ru" }
+  { "category": "business", "name": "Ведомости — Экономика", "url": "https://www.vedomosti.ru/rss/rubric/economics", "weight": 8, "lang": "ru" },
+  { "category": "business", "name": "Коммерсантъ — Экономика", "url": "https://www.kommersant.ru/RSS/section-economics.xml", "weight": 7, "lang": "ru" }
 ]

@@ -14,6 +14,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         arbitrage: resolve(__dirname, 'arbitrage.html'),
+        signals: resolve(__dirname, 'signals.html'),
       },
     },
   },
@@ -53,6 +54,15 @@ export default defineConfig({
             options: {
               cacheName: 'meridian-news',
               expiration: { maxEntries: 4, maxAgeSeconds: 60 * 60 * 24 * 3 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            urlPattern: ({ url }) => url.pathname.endsWith('/data/signals.json'),
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'meridian-signals',
+              expiration: { maxEntries: 4, maxAgeSeconds: 60 * 60 * 24 },
               cacheableResponse: { statuses: [0, 200] },
             },
           },

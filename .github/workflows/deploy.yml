@@ -4,10 +4,10 @@ on:
   push:
     branches: [main]
   schedule:
-    # каждые 2 часа; :17 чтобы не попадать в загруженную «верхушку часа».
-    # GitHub cron — best-effort (джиттер 5–30 мин, иногда пропуск). Для утреннего
-    # чтения это ок: важна «в итоге свежесть», а не точная минута.
-    - cron: '17 */2 * * *'
+    # каждые 30 минут (:07 и :37, со смещением от загруженной «верхушки часа»).
+    # Нужно для среднесрочных сигналов. GitHub cron — best-effort (джиттер
+    # 5–30 мин, иногда пропуск); для среднесрока и утренней ленты это ок.
+    - cron: '7,37 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -38,19 +38,27 @@ jobs:
       - name: Install
         run: pnpm install --no-frozen-lockfile
 
-      - name: Fetch news + build
+      - name: Fetch news
+        run: pnpm news
+
+      # Падение анализатора сигналов не должно ломать деплой сайта
+      - name: Generate signals
+        continue-on-error: true
+        run: pnpm signals
+
+      - name: Build site
         run: pnpm build
 
-      # Коммитим свежий снапшот ленты: keepalive cron'а (активность сбрасывает
-      # 60-дневный авто-disable) + история новостей + офлайн-фолбэк. [skip ci]
-      # не даёт пушу запустить новый прогон.
-      - name: Commit news snapshot
+      # Коммитим свежие снапшоты: keepalive cron'а (активность сбрасывает
+      # 60-дневный авто-disable) + история ленты и сигналов + офлайн-фолбэк.
+      # Маркер пропуска CI в сообщении не даёт пушу запустить новый прогон.
+      - name: Commit data snapshot
         continue-on-error: true
         run: |
           git config user.name "meridian-bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/data/news.json
-          git diff --staged --quiet || git commit -m "data: обновление ленты [skip ci]"
+          git add public/data/news.json public/data/signals.json
+          git diff --staged --quiet || git commit -m "data: обновление ленты и сигналов [skip ci]"
           git push
 
       - uses: actions/configure-pages@v5

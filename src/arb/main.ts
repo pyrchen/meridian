@@ -9,58 +9,25 @@ import {
   type ExSnapshot,
   type Opportunity,
 } from './exchanges'
+import { setupGate } from '../lib/gate'
 
 registerSW({ immediate: true })
 
-// ─────────────────────────────────────────────────────────────
-// Код доступа. Клиентский замок (security-by-obscurity): сравниваем
-// SHA-256 введённой фразы с хэшем ниже. Это НЕ серверная защита —
-// хэш виден в коде. Меняй фразу: положи сюда sha256 своей, команда в README.
-// Дефолтная фраза: "dawn-2026"
-const ARB_PASS_SHA256 =
-  '830b611571100cd45d48ad528285ef0aa707ae478bf43954a02cd0d38bbc5ac7'
-const UNLOCK_KEY = 'meridian-arb-unlock'
-
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
-
-async function sha256(s: string): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-
-function unlock() {
-  $('gate').hidden = true
-  $('term').hidden = false
-  start()
-}
-
-function initGate() {
-  if (sessionStorage.getItem(UNLOCK_KEY) === '1') {
-    unlock()
-    return
-  }
-  const form = $<HTMLFormElement>('gate-form')
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault()
-    const val = $<HTMLInputElement>('gate-pass').value
-    const err = $('gate-err')
-    if ((await sha256(val)) === ARB_PASS_SHA256) {
-      try {
-        sessionStorage.setItem(UNLOCK_KEY, '1')
-      } catch {}
-      unlock()
-    } else {
-      err.textContent = 'Неверный код'
-      $<HTMLInputElement>('gate-pass').value = ''
-    }
-  })
-}
 
 // ─────────────────────────────────────────────────────────────
 // Терминал
-// HTX режет браузерный CORS из части origin'ов → по умолчанию выключена,
-// остаётся опцией-тумблером (включишь — попробует, не выйдет → отметится offline).
-const DEFAULT_EXCHANGES = ['binance', 'bybit', 'okx', 'bitget']
+// Биржи с подтверждённым браузерным CORS (проверено с прод-origin).
+// HTX режет CORS из части origin'ов → по умолчанию выключена, остаётся опцией.
+const DEFAULT_EXCHANGES = [
+  'binance',
+  'bybit',
+  'okx',
+  'bitget',
+  'kraken',
+  'cryptocom',
+  'bitmart',
+]
 
 const state = {
   ids: EXCHANGES.filter((e) => DEFAULT_EXCHANGES.includes(e.id)).map((e) => e.id),
@@ -232,4 +199,7 @@ function start() {
 }
 
 // запуск после полной инициализации модуля (иначе TDZ при авто-разблокировке)
-initGate()
+setupGate(() => {
+  $('term').hidden = false
+  start()
+})

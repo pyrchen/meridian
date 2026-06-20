@@ -115,6 +115,53 @@ export const EXCHANGES: ExMeta[] = [
       return m
     },
   },
+  {
+    id: 'kraken',
+    name: 'Kraken',
+    url: 'https://api.kraken.com/0/public/Ticker',
+    parse: (raw) => {
+      const m = new Map<string, Quote>()
+      const res = (raw as any)?.result ?? {}
+      const NORM: Record<string, string> = { XBT: 'BTC', XDG: 'DOGE' }
+      for (const [key, t] of Object.entries(res) as [string, any][]) {
+        if (!key.endsWith('USDT') || key.includes('.')) continue
+        const base = NORM[key.slice(0, -4)] || key.slice(0, -4)
+        put(m, base, t.b?.[0], t.a?.[0], t.c?.[0])
+      }
+      return m
+    },
+  },
+  {
+    id: 'cryptocom',
+    name: 'Crypto.com',
+    url: 'https://api.crypto.com/exchange/v1/public/get-tickers',
+    parse: (raw) => {
+      const m = new Map<string, Quote>()
+      const arr = (raw as any)?.result?.data ?? (raw as any)?.result ?? []
+      for (const t of arr) {
+        if (typeof t.i !== 'string' || !t.i.endsWith('_USDT')) continue
+        // i=instrument, b=bid, k=ask, a=last
+        put(m, t.i.slice(0, -5), t.b, t.k, t.a)
+      }
+      return m
+    },
+  },
+  {
+    id: 'bitmart',
+    name: 'BitMart',
+    url: 'https://api-cloud.bitmart.com/spot/quotation/v3/tickers',
+    parse: (raw) => {
+      const m = new Map<string, Quote>()
+      const arr = (raw as any)?.data ?? []
+      // row: [symbol, last, v24, qv24, open, high, low, fluct, bid, bidSz, ask, askSz, ts]
+      for (const row of arr) {
+        const sym = row[0]
+        if (typeof sym !== 'string' || !sym.endsWith('_USDT')) continue
+        put(m, sym.slice(0, -5), row[8], row[10], row[1])
+      }
+      return m
+    },
+  },
 ]
 
 export interface ExSnapshot {

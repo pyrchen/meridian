@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Meridian · Сигналы</title>
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#090d18" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:wght@500;600&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      try {
+        const t = localStorage.getItem('meridian-theme');
+        if (t) document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div class="gate" id="gate">
+      <div class="gate__card">
+        <svg class="gate__mark" viewBox="0 0 64 64" aria-hidden="true">
+          <circle cx="32" cy="34" r="18" fill="none" stroke="#2a3450" stroke-width="2.4" />
+          <line x1="32" y1="8" x2="32" y2="58" stroke="#ffb14e" stroke-width="2.4" />
+          <circle cx="32" cy="15" r="4.2" fill="#ffb14e" />
+        </svg>
+        <h1>Сигналы</h1>
+        <p>Приватный анализатор альткойнов. Введи код доступа.</p>
+        <form id="gate-form">
+          <input
+            type="password"
+            id="gate-pass"
+            placeholder="код доступа"
+            autocomplete="current-password"
+            aria-label="Код доступа"
+          />
+          <button type="submit">Войти</button>
+        </form>
+        <div class="gate__err" id="gate-err"></div>
+      </div>
+    </div>
+
+    <main class="term" id="app" hidden>
+      <header class="term__bar">
+        <div class="wrap term__bar-row">
+          <div class="term__title">
+            MERI<span class="brand__tick"></span>DIAN · Сигналы
+          </div>
+          <span class="live" id="live">
+            <span class="live__dot"></span><span id="live-text">загрузка…</span>
+          </span>
+          <nav class="term__nav">
+            <a href="./">← Новости</a>
+            <a href="./arbitrage.html">Терминал</a>
+          </nav>
+        </div>
+      </header>
+
+      <div class="wrap">
+        <div class="stats">
+          <div class="stat good"><b id="s-winrate">—</b><span>винрейт (TP/SL)</span></div>
+          <div class="stat"><b id="s-open">—</b><span>открытых сигналов</span></div>
+          <div class="stat"><b id="s-avgr">—</b><span>средний R</span></div>
+          <div class="stat"><b id="s-closed">—</b><span>закрыто всего</span></div>
+          <div class="stat"><b id="s-universe">—</b><span>монет в сканере</span></div>
+        </div>
+
+        <div class="filters2">
+          <div class="seg" id="tabs"></div>
+          <div class="seg" id="sides"></div>
+          <label class="search2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+            <input type="search" id="q" placeholder="Монета…" aria-label="Поиск по монете" />
+          </label>
+        </div>
+
+        <div class="sig-grid" id="grid"></div>
+        <div class="term__empty" id="empty" hidden></div>
+
+        <div class="disclaimer">
+          <b>Не финансовый совет, не гарантия прибыли.</b> Сигналы — результат
+          технического анализа (тренд по дневному графику + вход по 4h: EMA, RSI,
+          MACD, ATR, ADX, объём) и могут быть убыточными. Среднесрочный горизонт:
+          сделки живут часами-днями. Вход/стоп/тейк — ориентир от цены на момент
+          сигнала; реальное исполнение зависит от проскальзывания, комиссий и
+          ликвидности. Исход (TP/SL) считается по свечам; при одновременном
+          касании берётся стоп. Управляй риском сам — размер позиции, плечо,
+          диверсификация на твоей ответственности.
+        </div>
+      </div>
+    </main>
+
+    <script type="module" src="/src/signals/main.ts"></script>
+  </body>
+</html>

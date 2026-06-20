@@ -125,13 +125,22 @@
     opacity: 0.35;
   }
 }
-.term__back {
+.term__back,
+.term__nav {
   margin-left: auto;
+}
+.term__nav {
+  display: flex;
+  gap: 16px;
+}
+.term__back,
+.term__nav a {
   font-family: var(--sans);
   font-size: 13px;
   color: var(--haze);
 }
-.term__back:hover {
+.term__back:hover,
+.term__nav a:hover {
   color: var(--first-light);
 }
 

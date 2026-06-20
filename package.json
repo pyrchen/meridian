@@ -7,8 +7,9 @@
   "scripts": {
     "dev": "vite",
     "news": "node scripts/fetch-news.mjs",
-    "build": "node scripts/fetch-news.mjs && vite build",
-    "build:site": "vite build",
+    "signals": "node scripts/gen-signals.mjs",
+    "build": "vite build",
+    "build:all": "node scripts/fetch-news.mjs && node scripts/gen-signals.mjs && vite build",
     "preview": "vite preview --host",
     "icons": "node scripts/gen-icons.mjs"
   },

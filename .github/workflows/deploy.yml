@@ -11,7 +11,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -40,6 +40,18 @@ jobs:
 
       - name: Fetch news + build
         run: pnpm build
+
+      # Коммитим свежий снапшот ленты: keepalive cron'а (активность сбрасывает
+      # 60-дневный авто-disable) + история новостей + офлайн-фолбэк. [skip ci]
+      # не даёт пушу запустить новый прогон.
+      - name: Commit news snapshot
+        continue-on-error: true
+        run: |
+          git config user.name "meridian-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/data/news.json
+          git diff --staged --quiet || git commit -m "data: обновление ленты [skip ci]"
+          git push
 
       - uses: actions/configure-pages@v5
         with:

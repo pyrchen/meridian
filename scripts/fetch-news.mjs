@@ -125,9 +125,35 @@ function cleanSummary(item) {
   return s.slice(0, 297).replace(/\s+\S*$/, '') + '…'
 }
 
+const FEED_TIMEOUT = 12000
+
+// Своя загрузка с жёстким abort — rss-parser.parseURL иногда не прерывает
+// зависший сокет, из-за чего Promise.allSettled может не завершиться (CI-hang).
+async function fetchText(url) {
+  const ctrl = new AbortController()
+  const t = setTimeout(() => ctrl.abort(), FEED_TIMEOUT)
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      redirect: 'follow',
+      headers: {
+        'User-Agent':
+          'MeridianNewsBot/1.0 (+https://github.com; personal news digest)',
+        Accept:
+          'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
+      },
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return await res.text()
+  } finally {
+    clearTimeout(t)
+  }
+}
+
 async function fetchSource(src) {
   try {
-    const feed = await parser.parseURL(src.url)
+    const xml = await fetchText(src.url)
+    const feed = await parser.parseString(xml)
     const items = (feed.items || []).map((it) => {
       const url = (it.link || it.guid || '').trim()
       const title = stripHtml(it.title || '').trim()
@@ -235,6 +261,12 @@ function rankCategory(items, now) {
 }
 
 async function main() {
+  // последний рубеж против зависания (на случай нештатной сети в CI)
+  const watchdog = setTimeout(() => {
+    console.error('Watchdog: сбор превысил 100с — аварийный выход')
+    process.exit(1)
+  }, 100_000)
+
   const sources = JSON.parse(await readFile(SOURCES_PATH, 'utf8'))
   const enabled = sources.filter((s) => s.enabled !== false)
   console.log(`Fetching ${enabled.length} feeds…`)
@@ -262,6 +294,9 @@ async function main() {
   await mkdir(dirname(OUT_PATH), { recursive: true })
   await writeFile(OUT_PATH, JSON.stringify(out), 'utf8')
   console.log(`\nWrote ${total} items across ${Object.keys(categories).length} categories → ${OUT_PATH}`)
+
+  clearTimeout(watchdog)
+  process.exit(0) // undici keep-alive pool иначе может задержать выход
 }
 
 main().catch((err) => {

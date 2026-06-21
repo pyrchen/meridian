@@ -168,7 +168,7 @@ function scoped(): Signal[] {
   const d = state.data
   if (!d) return []
   let list: Signal[] =
-    state.status === 'open' ? d.open : state.status === 'closed' ? d.closed : [...d.open, ...d.closed]
+    state.status === 'closed' ? d.closed : d.open
   // Рынок берём из markets сигнала: фьючерсы — всё с 'futures'; спот — всё с 'spot'
   // (сверхдолгосрок — только спот, скальп — только фьючерсы).
   list = list.filter((s) => (s.markets || ['futures']).includes(state.mode))
@@ -263,7 +263,7 @@ function seg(
 
 function baseByStatus(): Signal[] {
   const d = state.data!
-  return state.status === 'open' ? d.open : state.status === 'closed' ? d.closed : [...d.open, ...d.closed]
+  return state.status === 'closed' ? d.closed : d.open
 }
 
 function renderControls() {
@@ -305,9 +305,8 @@ function renderControls() {
     [
       { key: 'open', label: 'Открытые', n: d.open.length },
       { key: 'closed', label: 'Закрытые', n: d.closed.length },
-      { key: 'all', label: 'Все' },
     ],
-    state.status,
+    state.status === 'all' ? 'open' : state.status,
     (k) => {
       state.status = k as typeof state.status
       renderControls()

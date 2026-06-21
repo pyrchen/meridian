@@ -623,11 +623,9 @@ async function main() {
       // бэкафилл для сигналов, созданных на прежней схеме
       if (!sig.horizon) sig.horizon = 'mid'
       if (!sig.timeframe) sig.timeframe = '4h'
-      if (!sig.spark || !sig.etaHours) {
-        const cl = closed(candles, now)
-        if (!sig.spark) sig.spark = cl.slice(-SPARK_N).map((k) => round(k.c))
-        if (!sig.etaHours) sig.etaHours = estimateEtaHours(sig.indicators?.adx ?? 22, 4)
-      }
+      const cl = closed(candles, now)
+      sig.spark = cl.slice(-SPARK_N).map((k) => round(k.c)) // всегда обновляем — нужно для прогресса к цели
+      if (!sig.etaHours) sig.etaHours = estimateEtaHours(sig.indicators?.adx ?? 22, 4)
       stillOpen.push(sig)
     }
   }

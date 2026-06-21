@@ -100,6 +100,15 @@ function closed(cs, now) {
   return cs.filter((k) => k.ct <= now)
 }
 
+function isoWeek(ts) {
+  const d = new Date(ts)
+  d.setUTCHours(0, 0, 0, 0)
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7))
+  const y = d.getUTCFullYear()
+  const w = Math.ceil(((d - new Date(Date.UTC(y, 0, 1))) / 86400000 + 1) / 7)
+  return `${y}-W${String(w).padStart(2, '0')}`
+}
+
 async function mapLimit(items, limit, fn) {
   const ret = new Array(items.length)
   let i = 0
@@ -337,13 +346,15 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
 
   // ── ОВЕРЛЕИ поверх базы: системный риск BTC + новости ──
   const w = H.key === 'scalp' ? 0.5 : 1
+  let btcDelta = 0
   if (side === 'long') {
-    if (btc.dir === 'down') { score -= 12 * w; reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов') }
-    else if (btc.dir === 'up') { score += 4 * w; reasons.push('BTC в восходящем тренде — попутный ветер') }
+    if (btc.dir === 'down') { btcDelta = -12 * w; score += btcDelta; reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов') }
+    else if (btc.dir === 'up') { btcDelta = 4 * w; score += btcDelta; reasons.push('BTC в восходящем тренде — попутный ветер') }
   } else {
-    if (btc.dir === 'up') { score -= 10 * w; reasons.push('⚠ BTC растёт — риск для шорта альта') }
-    else if (btc.dir === 'down') { score += 4 * w; reasons.push('BTC слабый — поддержка шорта') }
+    if (btc.dir === 'up') { btcDelta = -10 * w; score += btcDelta; reasons.push('⚠ BTC растёт — риск для шорта альта') }
+    else if (btc.dir === 'down') { btcDelta = 4 * w; score += btcDelta; reasons.push('BTC слабый — поддержка шорта') }
   }
+  let newsDelta = 0
 
   let news = null
   if (newsHit) {
@@ -353,14 +364,20 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
     } else {
       const against = (side === 'long' && news.sentiment === 'neg') || (side === 'short' && news.sentiment === 'pos')
       const forIt = (side === 'long' && news.sentiment === 'pos') || (side === 'short' && news.sentiment === 'neg')
-      if (against) { score -= 14; reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`) }
-      else if (forIt) { score += 6; reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`) }
+      if (against) { newsDelta = -14; score += newsDelta; reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`) }
+      else if (forIt) { newsDelta = 6; score += newsDelta; reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`) }
       else reasons.push(`В новостях ${news.count} упоминаний — проверь фон`)
     }
   }
 
   score = Math.min(100, Math.max(0, Math.round(score)))
   if (score < minScore) return null
+
+  const scoreBreakdown = {
+    trend: fTrend, momentum: fMom, regime: fReg, volume: fVol, rs: fRs,
+    btc: Math.round(btcDelta), news: newsDelta,
+    base: fTrend + fMom + fReg + fVol + fRs, total: score,
+  }
 
   const slDist = atrMult * a
   const entry = close
@@ -407,6 +424,8 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
     newsSentiment: news ? news.sentiment : null,
     newsCount: news ? news.count : 0,
     spark: fC.slice(-SPARK_N).map((x) => round(x)),
+    scoreBreakdown,
+    cohortWeek: isoWeek(now),
   }
 }
 

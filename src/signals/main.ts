@@ -36,6 +36,11 @@ interface Signal {
   newsSentiment?: 'pos' | 'neg' | 'neutral' | null
   newsCount?: number
   spark?: number[]
+  scoreBreakdown?: {
+    trend: number; momentum: number; regime: number; volume: number; rs: number
+    btc: number; news: number; base: number; total: number
+  }
+  cohortWeek?: string
   timeframe: string
   createdAt: string
   status: 'open' | 'tp' | 'sl' | 'expired'
@@ -490,6 +495,9 @@ function card(s: Signal, i: number): HTMLElement {
     c.append(nb)
   }
 
+  // инспектор
+  c.append(inspector(s))
+
   // подвал
   const foot = el('div', { class: 'sig-foot' })
   if (isOpen) {
@@ -556,6 +564,81 @@ function profitBlock(s: Signal, spot: boolean): HTMLElement {
   wrap.append(grid)
   const sz = sizingRow(s)
   if (sz) wrap.append(sz)
+  return wrap
+}
+
+// ── инспектор сигнала: разбивка скора + все индикаторы ──
+function inspector(s: Signal): HTMLElement {
+  const wrap = el('div', { class: 'insp' })
+
+  const toggle = el('button', { class: 'insp-toggle' }, '▸ Почему этот сигнал?')
+  const body = el('div', { class: 'insp-body', hidden: 'true' })
+  toggle.onclick = () => {
+    const open = body.hidden
+    body.hidden = !open
+    toggle.textContent = (open ? '▾' : '▸') + ' Почему этот сигнал?'
+  }
+  wrap.append(toggle)
+
+  const bd = s.scoreBreakdown
+  if (bd) {
+    const section = el('div', { class: 'insp-section' })
+    section.append(el('div', { class: 'insp-h' }, 'Разбивка скора'))
+
+    const rows: [string, number, number, string][] = [
+      ['Тренд', bd.trend, 33, ''],
+      ['Моментум', bd.momentum, 27, ''],
+      ['ADX / волатильность', bd.regime, 14, bd.regime < 0 ? 'neg' : ''],
+      ['Объём', bd.volume, 8, ''],
+      ['Относит. сила', bd.rs, 12, ''],
+      ['BTC режим', bd.btc, 12, bd.btc < 0 ? 'neg' : bd.btc > 0 ? 'pos' : 'zero'],
+      ['Новости', bd.news, 14, bd.news < 0 ? 'neg' : bd.news > 0 ? 'pos' : 'zero'],
+    ]
+    for (const [label, val, max, cls] of rows) {
+      const row = el('div', { class: 'insp-row' })
+      row.append(el('span', { class: 'insp-lbl' }, label))
+      const bar = el('div', { class: 'insp-bar-wrap' })
+      const pct = Math.abs(val) / max * 100
+      const fill = el('div', { class: `insp-fill ${cls || (val > 0 ? 'pos' : val < 0 ? 'neg' : 'zero')}` })
+      fill.style.width = `${Math.min(100, pct)}%`
+      bar.append(fill)
+      row.append(bar)
+      row.append(el('span', { class: 'insp-val' }, (val > 0 ? '+' : '') + val))
+      section.append(row)
+    }
+    const total = el('div', { class: 'insp-total' })
+    total.append(el('span', {}, `База: ${bd.base}`))
+    total.append(el('b', {}, `Итог: ${bd.total} / 100`))
+    section.append(total)
+    body.append(section)
+  }
+
+  // индикаторы
+  const ind = s.indicators
+  const indSec = el('div', { class: 'insp-section' })
+  indSec.append(el('div', { class: 'insp-h' }, 'Индикаторы на момент сигнала'))
+  const grid = el('div', { class: 'insp-ind' })
+  const pairs: [string, string][] = [
+    ['RSI', String(ind.rsi)],
+    ['ADX', String(ind.adx)],
+    ['+DI / −DI', `${ind.plusDI ?? '?'} / ${ind.minusDI ?? '?'}`],
+    ['MACD-hist', String(ind.macdHist)],
+    ['Vol%', ind.volPct != null ? (ind.volPct * 100).toFixed(0) + '%' : '—'],
+    ['R:R', `${((s.targetPct || 0) / (s.riskPct || 1)).toFixed(1)}:1`],
+    ['ATR', String(s.atr ?? '—')],
+    ['RS-ранг', s.rsRank != null ? `топ ${Math.round((1 - s.rsRank) * 100)}%` : '—'],
+  ]
+  for (const [k, v] of pairs) {
+    const cell = el('div', { class: 'insp-cell' })
+    cell.append(el('span', { class: 'insp-cell-k' }, k))
+    cell.append(el('span', { class: 'insp-cell-v' }, v))
+    grid.append(cell)
+  }
+  indSec.append(grid)
+  if (s.cohortWeek) indSec.append(el('div', { class: 'insp-cohort' }, `Когорта: ${s.cohortWeek}`))
+  body.append(indSec)
+
+  wrap.append(body)
   return wrap
 }
 

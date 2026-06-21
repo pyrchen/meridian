@@ -27,6 +27,10 @@ const ROOT = resolve(__dirname, '..')
 const OUT_PATH = resolve(ROOT, 'public', 'data', 'signals.json')
 const NEWS_PATH = resolve(ROOT, 'public', 'data', 'news.json')
 
+// Гео-нейтральное публичное зеркало Binance (api.binance.com отдаёт 451 на
+// US-IP, где крутятся GitHub-раннеры). Тот же формат, без авторизации.
+const BINANCE = 'https://data-api.binance.vision'
+
 const TOP_N = 100
 const SCORE_MIN = 62
 const ATR_MULT = 1.8
@@ -68,7 +72,7 @@ async function getJSON(url) {
 }
 
 async function klines(symbol, interval, limit) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+  const url = `${BINANCE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
   const raw = await getJSON(url)
   return raw.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5], ct: k[6] }))
 }
@@ -95,7 +99,7 @@ async function mapLimit(items, limit, fn) {
 }
 
 async function buildUniverse() {
-  const all = await getJSON('https://api.binance.com/api/v3/ticker/24hr')
+  const all = await getJSON(`${BINANCE}/api/v3/ticker/24hr`)
   return all
     .filter((t) => typeof t.symbol === 'string' && t.symbol.endsWith('USDT'))
     .map((t) => ({ symbol: t.symbol, base: t.symbol.slice(0, -4), qv: +t.quoteVolume }))

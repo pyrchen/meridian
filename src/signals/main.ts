@@ -93,6 +93,7 @@ const state = {
   horizon: 'all' as 'all' | 'scalp' | 'mid' | 'long' | 'veryLong',
   status: 'open' as 'open' | 'closed' | 'all',
   query: '',
+  prices: new Map<string, number>(),
 }
 
 function hz(s: Signal): 'scalp' | 'mid' | 'long' | 'veryLong' {
@@ -122,8 +123,25 @@ function money(n: number): string {
   return (n < 0 ? '−$' : '+$') + (v >= 100 ? v.toFixed(0) : v.toFixed(1))
 }
 
+async function fetchPrices(): Promise<void> {
+  const d = state.data
+  if (!d) return
+  const symbols = [...new Set(d.open.map((s) => s.symbol))]
+  if (!symbols.length) return
+  try {
+    const q = encodeURIComponent(JSON.stringify(symbols))
+    const res = await fetch(`https://data-api.binance.vision/api/v3/ticker/price?symbols=${q}`, {
+      cache: 'no-store',
+    })
+    if (!res.ok) return
+    const rows = (await res.json()) as { symbol: string; price: string }[]
+    for (const r of rows) state.prices.set(r.symbol, parseFloat(r.price))
+    renderGrid()
+  } catch {}
+}
+
 function openProgress(s: Signal): number | null {
-  const last = s.spark?.[s.spark.length - 1]
+  const last = state.prices.get(s.symbol) ?? s.spark?.[s.spark.length - 1]
   if (!last || !s.entry || !s.tp || s.entry === s.tp) return null
   const p =
     s.side === 'long'
@@ -138,6 +156,7 @@ async function load() {
     if (!res.ok) throw new Error(String(res.status))
     state.data = (await res.json()) as SignalsData
     renderAll()
+    fetchPrices()
   } catch {
     if (state.data) return
     $('grid').replaceChildren()
@@ -560,4 +579,5 @@ setupGate(() => {
   $('app').hidden = false
   tick()
   setInterval(tick, 5 * 60 * 1000)
+  setInterval(fetchPrices, 30_000)
 })

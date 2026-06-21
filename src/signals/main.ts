@@ -25,10 +25,13 @@ interface Signal {
   targetPct: number
   strength: number
   etaHours: number
+  posSizePct?: number
+  riskBudgetPct?: number
+  rsRank?: number | null
   horizon?: 'scalp' | 'mid' | 'long' | 'veryLong'
   horizonLabel?: string
   reasons: string[]
-  indicators: { rsi: number; adx: number; macdHist: number }
+  indicators: { rsi: number; adx: number; macdHist: number; plusDI?: number; minusDI?: number; volPct?: number | null }
   news?: { title: string; source: string; url: string; publishedAt: string }[] | null
   newsSentiment?: 'pos' | 'neg' | 'neutral' | null
   newsCount?: number
@@ -41,7 +44,24 @@ interface Signal {
   durationH?: number
   pnlPct?: number
   r?: number
+  netPnlPct?: number
+  netR?: number
+  costPct?: number
   toTpPct?: number | null
+  maeR?: number | null
+}
+
+interface Stratum {
+  horizon: string
+  side: string
+  closedTotal: number
+  decided: number
+  winRate: number
+  netWinRate: number
+  avgR: number
+  avgNetR: number
+  totalNetPnlPct: number
+  enough: boolean
 }
 
 interface SignalsData {
@@ -53,9 +73,15 @@ interface SignalsData {
     wins: number
     losses: number
     winRate: number
+    netWinRate?: number
     avgR: number
+    avgNetR?: number
+    totalPnlPct?: number
+    totalNetPnlPct?: number
     avgWinDurationH: number
     avgEtaOpenH: number
+    sampleGate?: number
+    byStratum?: Stratum[]
   }
   open: Signal[]
   closed: Signal[]
@@ -131,15 +157,64 @@ function renderAll() {
 
 function renderStats() {
   const s = state.data!.stats
-  $('s-winrate').textContent = `${s.winRate}%`
+  // винрейт и R показываем НЕТТО (после комиссий+проскальзывания) — честный ориентир,
+  // брутто прячем в подсказку
+  const netWr = s.netWinRate ?? s.winRate
+  const wr = $('s-winrate')
+  wr.textContent = `${netWr}%`
+  wr.title = `брутто ${s.winRate}% · нетто учитывает комиссию + проскальзывание`
+  setLabel(wr, 'винрейт нетто')
   $('s-open').textContent = String(s.open)
   // фактический средний срок до тейка, пока нет закрытых — прогноз по открытым
   $('s-eta').textContent = s.avgWinDurationH
     ? fmtDur(s.avgWinDurationH)
     : '≈' + fmtDur(s.avgEtaOpenH)
-  $('s-avgr').textContent = (s.avgR >= 0 ? '+' : '') + s.avgR + 'R'
+  const netR = s.avgNetR ?? s.avgR
+  const ar = $('s-avgr')
+  ar.textContent = (netR >= 0 ? '+' : '') + netR + 'R'
+  ar.title = `брутто ${s.avgR}R`
+  setLabel(ar, 'средний R нетто')
   $('s-closed').textContent = `${s.wins} / ${s.losses}`
   $('s-universe').textContent = String(state.data!.universeSize)
+  renderStrata()
+}
+
+function setLabel(valueEl: HTMLElement, text: string) {
+  const lbl = valueEl.nextElementSibling
+  if (lbl && lbl.tagName === 'SPAN') lbl.textContent = text
+}
+
+// разбивка по стратам (горизонт × сторона): нетто-винрейт/R, с гейтом по выборке
+function renderStrata() {
+  const host = document.getElementById('strata')
+  if (!host) return
+  const s = state.data!.stats
+  const rows = (s.byStratum || []).filter((r) => r.closedTotal > 0)
+  if (!rows.length) {
+    host.replaceChildren()
+    return
+  }
+  const hzL: Record<string, string> = { scalp: 'Скальп', mid: 'Средне', long: 'Долго', veryLong: 'Сверхдолго' }
+  const frag = document.createDocumentFragment()
+  const head = el('div', { class: 'strat-row strat-head' })
+  head.append(el('span', {}, 'Страта'), el('span', {}, 'сделок'), el('span', {}, 'винрейт нетто'), el('span', {}, 'ср. R нетто'))
+  frag.append(head)
+  for (const r of rows) {
+    const row = el('div', { class: 'strat-row' })
+    const name = `${hzL[r.horizon] || r.horizon} · ${r.side === 'long' ? 'лонг' : 'шорт'}`
+    row.append(el('span', { class: 'strat-name' }, name))
+    row.append(el('span', {}, `${r.decided}`))
+    if (!r.enough) {
+      const need = (s.sampleGate || 50) - r.decided
+      row.append(el('span', { class: 'strat-wait' }, `мало данных`))
+      row.append(el('span', { class: 'strat-wait' }, `ещё ~${need > 0 ? need : 0}`))
+    } else {
+      row.append(el('span', { class: r.netWinRate >= 50 ? 'up' : 'down' }, `${r.netWinRate}%`))
+      row.append(el('span', { class: r.avgNetR >= 0 ? 'up' : 'down' }, `${r.avgNetR >= 0 ? '+' : ''}${r.avgNetR}R`))
+    }
+    frag.append(row)
+  }
+  host.replaceChildren(frag)
 }
 
 function seg(
@@ -337,11 +412,17 @@ function card(s: Signal, i: number): HTMLElement {
   }
   c.append(eta)
 
-  // как далеко цена дошла к цели до закрытия (для стопа/истёкших)
-  if (!isOpen && (s.status === 'sl' || s.status === 'expired') && s.toTpPct != null) {
+  // как далеко цена дошла к цели + макс. просадка до закрытия (стоп/истёкшие)
+  if (!isOpen && (s.status === 'sl' || s.status === 'expired') && (s.toTpPct != null || s.maeR != null)) {
     const mfe = el('div', { class: 'sig-mfe' })
-    mfe.append(el('span', { class: 'mfe-k' }, 'Дошёл до цели'))
-    mfe.append(el('span', { class: 'mfe-v' }, `${s.toTpPct}%`))
+    if (s.toTpPct != null) {
+      mfe.append(el('span', { class: 'mfe-k' }, 'Дошёл до цели'))
+      mfe.append(el('span', { class: 'mfe-v' }, `${s.toTpPct}%`))
+    }
+    if (s.maeR != null) {
+      mfe.append(el('span', { class: 'mfe-k' }, 'Макс. просадка'))
+      mfe.append(el('span', { class: 'mfe-v down' }, `${s.maeR}R`))
+    }
     c.append(mfe)
   }
 
@@ -371,8 +452,12 @@ function card(s: Signal, i: number): HTMLElement {
     const label = s.status === 'tp' ? 'Тейк' : s.status === 'sl' ? 'Стоп' : 'Истёк'
     foot.append(el('span', { class: `outcome ${s.status}` }, label))
     foot.append(el('span', {}, timeAgo(s.closedAt!)))
-    const pnl = s.pnlPct ?? 0
-    foot.append(el('span', { class: `pnl ${pnl >= 0 ? 'up' : 'down'}` }, `${pnl >= 0 ? '+' : ''}${pnl}%`))
+    // показываем PnL нетто (после комиссий), брутто — в подсказке
+    const net = s.netPnlPct != null
+    const pnl = net ? s.netPnlPct! : s.pnlPct ?? 0
+    const pnlEl = el('span', { class: `pnl ${pnl >= 0 ? 'up' : 'down'}` }, `${pnl >= 0 ? '+' : ''}${pnl}%${net ? ' нетто' : ''}`)
+    if (net) pnlEl.title = `брутто ${s.pnlPct}%`
+    foot.append(pnlEl)
   }
   c.append(foot)
   return c
@@ -389,6 +474,15 @@ function levelCell(label: string, value: string, sub: string, cls = ''): HTMLEle
 // профит/убыток от базы $100. Спот — 1× без плеча; фьючерсы — таблица по плечам.
 // При плече L: профит$ = targetPct × L, убыток$ = riskPct × L. Если riskPct × L ≥ 100 —
 // стоп лежит за ликвидацией (позицию вынесет раньше), помечаем «ликвид.».
+// Внизу — совет по размеру: сколько $ ставить, чтобы рисковать ~1% от $100.
+function sizingRow(s: Signal): HTMLElement | null {
+  if (s.posSizePct == null) return null
+  const row = el('div', { class: 'pnl100-size' })
+  row.append(el('span', {}, `Размер при риске ${s.riskBudgetPct ?? 1}%`))
+  row.append(el('b', {}, `$${s.posSizePct} из $100`))
+  return row
+}
+
 function profitBlock(s: Signal, spot: boolean): HTMLElement {
   const wrap = el('div', { class: 'sig-pnl100' })
   const tgt = s.targetPct || 0
@@ -399,6 +493,8 @@ function profitBlock(s: Signal, spot: boolean): HTMLElement {
     row.append(el('span', { class: 'up' }, 'к цели ' + money(tgt)))
     row.append(el('span', { class: 'down' }, 'к защите ' + money(-rsk)))
     wrap.append(row)
+    const sz = sizingRow(s)
+    if (sz) wrap.append(sz)
     return wrap
   }
   wrap.append(el('div', { class: 'pnl100-h' }, 'Профит со $100 · плечо'))
@@ -411,6 +507,8 @@ function profitBlock(s: Signal, spot: boolean): HTMLElement {
     else grid.append(el('span', { class: 'down' }, money(-rsk * L)))
   }
   wrap.append(grid)
+  const sz = sizingRow(s)
+  if (sz) wrap.append(sz)
   return wrap
 }
 

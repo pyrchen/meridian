@@ -20,7 +20,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { ema, rsi, macd, atr, adx, sma } from './indicators.mjs'
+import { ema, rsi, macd, atr, dmi, sma, volPercentile, aggregate } from './indicators.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
@@ -37,19 +37,31 @@ const RR_MIN = 2 // минимальное соотношение прибыль
 const ATR_MULT = 1.8
 const RR = 2.5
 const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // срок жизни по горизонту
-const KEEP_CLOSED = 300
+const KEEP_CLOSED = 1500 // держим больше закрытых — нужно для будущей калибровки/валидации
 const SPARK_N = 44
 const TIMEOUT = 12000
 
-// Горизонты. rr/minScore/atrMult/trendOpts переопределяют глобальные дефолты.
-// veryLong — фундаментальный сверхдолгосрок (недельные свечи): только спот, только покупка.
+// Стоимость сделки (round-trip, % от номинала) — для честных net-метрик.
+// Фьючерс-фандинг НЕ учитываем: fapi гео-блокнут (451) с US-раннеров CI, зеркала нет.
+const FEE_RT = { futures: 0.1, spot: 0.2 } // тейкерская комиссия туда-обратно
+const SLIP_RT = 0.06 // консервативное проскальзывание round-trip
+const SLIP_STOP_EXTRA = 0.05 // добавка на проскальзывание по стопу/истечению (гэп)
+const RISK_BUDGET_PCT = 1 // риск на сделку для совета по размеру (% депозита)
+const QV_MIN = 1.5e6 // минимальный 24ч объём ($) — отсев неликвидного хвоста (стоп нельзя ставить в шум)
+
+// Горизонты. rr/minScore/atrMult/trendOpts/rsDays/trendAggregate переопределяют дефолты.
+// Соотношение сигнального и трендового ТФ держим 4–7× (не 1×), чтобы фильтр был
+// действительно старше сигнала и не дублировал тот же ряд:
+//   • long   — вход 1d, тренд недельный
+//   • veryLong — вход 1w, тренд «месячный» (агрегируем 4 недели в свечу)
 const HORIZONS = [
   { key: 'scalp', label: 'Скальп', sigTf: '1h', trendTf: '4h', tfHours: 1 },
-  { key: 'mid', label: 'Средне', sigTf: '4h', trendTf: '1d', tfHours: 4 },
-  { key: 'long', label: 'Долго', sigTf: '1d', trendTf: '1d', tfHours: 24 },
+  { key: 'mid', label: 'Средне', sigTf: '4h', trendTf: '1d', tfHours: 4, rsDays: 7 },
+  { key: 'long', label: 'Долго', sigTf: '1d', trendTf: '1w', tfHours: 24, rsDays: 21, trendOpts: { fast: 20, slow: 50, min: 55 } },
   {
     key: 'veryLong', label: 'Сверхдолго', sigTf: '1w', trendTf: '1w', tfHours: 168,
-    rr: 3, minScore: 75, atrMult: 2.2, trendOpts: { fast: 30, slow: 50, min: 60 },
+    rr: 3, minScore: 75, atrMult: 2.2, rsDays: 60,
+    trendAggregate: 4, trendOpts: { fast: 6, slow: 12, min: 18 },
   },
 ]
 const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320, '1w': 260 }
@@ -112,7 +124,8 @@ async function buildUniverse() {
     .map((t) => ({ symbol: t.symbol, base: t.symbol.slice(0, -4), qv: +t.quoteVolume }))
     .filter(
       (r) =>
-        r.base && r.base !== 'BTC' && !STABLES.has(r.base) && !LEVERAGED.test(r.base) && Number.isFinite(r.qv),
+        r.base && r.base !== 'BTC' && !STABLES.has(r.base) && !LEVERAGED.test(r.base) &&
+        Number.isFinite(r.qv) && r.qv >= QV_MIN, // отсев неликвидных: стоп нельзя ставить в шум тонкой монеты
     )
     .sort((a, b) => b.qv - a.qv)
     .slice(0, TOP_N)
@@ -225,8 +238,11 @@ function estimateEtaHours(adxv, tfHours, rr = RR, atrMult = ATR_MULT) {
   return Math.round(((rr * atrMult) / eff) * tfHours)
 }
 
-function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
-  const trend = trendDir(closed(trendCandles, now), H.trendOpts)
+function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRank) {
+  // тренд старшего ТФ (для veryLong агрегируем недели в «месяцы» — реальное 4× разделение)
+  let tc = closed(trendCandles, now)
+  if (H.trendAggregate) tc = aggregate(tc, H.trendAggregate)
+  const trend = trendDir(tc, H.trendOpts)
   if (!trend) return null
   const f = closed(sigCandles, now)
   if (f.length < 60) return null
@@ -235,15 +251,18 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
   const fH = f.map((k) => k.h)
   const fL = f.map((k) => k.l)
   const fV = f.map((k) => k.v)
-  const close = fC[fC.length - 1]
+  const last = fC.length - 1
+  const close = fC[last]
   const ema50 = ema(fC, 50)
   const ema200 = fC.length >= 200 ? ema(fC, 200) : null
   const r = rsi(fC, 14)
   const m = macd(fC)
   const a = atr(fH, fL, fC, 14)
-  const adxv = adx(fH, fL, fC, 14)
+  const d = dmi(fH, fL, fC, 14) // { adx, plusDI, minusDI }
   const volAvg = sma(fV, 20)
-  if (ema50 == null || r == null || !m || a == null || adxv == null) return null
+  const volPct = volPercentile(fC, 14, 100) // перцентиль волатильности 0..1 (или null)
+  if (ema50 == null || r == null || !m || a == null || !d) return null
+  const adxv = d.adx
 
   const side = trend === 'up' ? 'long' : 'short'
   if (H.key === 'veryLong' && side === 'short') return null // сверхдолгосрок — только покупка на споте
@@ -251,68 +270,96 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
   const atrMult = H.atrMult ?? ATR_MULT
   const minScore = H.minScore ?? SCORE_MIN
   if (rr < RR_MIN) return null // фильтр: соотношение прибыль/риск ниже 2:1 не сохраняем
+
+  // ── обязательные условия входа (гейты) ──
   const crossUp = m.prevHist != null && m.prevHist <= 0 && m.hist > 0
   const crossDown = m.prevHist != null && m.prevHist >= 0 && m.hist < 0
-  const volHigh = volAvg != null && fV[fV.length - 1] > volAvg * 1.2
-
-  const reasons = []
-  let score = 0
-
   if (side === 'long') {
     if (!(close > ema50) || !(m.hist > 0) || !(r >= 45 && r <= 68) || adxv < 18) return null
-    reasons.push(`Тренд ${H.trendTf} вверх: цена > EMA200, EMA50 > EMA200`)
-    score += 25
-    reasons.push(`${H.sigTf}: цена выше EMA50 — импульс по тренду`)
-    score += 15
-    reasons.push(crossUp ? 'MACD пересёк сигнальную вверх' : 'MACD-гистограмма положительна')
-    score += crossUp ? 22 : 12
-    if (r >= 50 && r <= 62) { reasons.push(`RSI ${r.toFixed(0)} — здоровый импульс`); score += 13 }
-    else { reasons.push(`RSI ${r.toFixed(0)} в рабочей зоне`); score += 7 }
-    if (ema200 != null && close > ema200) { reasons.push(`${H.sigTf}: цена выше EMA200`); score += 8 }
   } else {
     if (!(close < ema50) || !(m.hist < 0) || !(r >= 32 && r <= 55) || adxv < 18) return null
-    reasons.push(`Тренд ${H.trendTf} вниз: цена < EMA200, EMA50 < EMA200`)
-    score += 25
-    reasons.push(`${H.sigTf}: цена ниже EMA50 — импульс по тренду`)
-    score += 15
-    reasons.push(crossDown ? 'MACD пересёк сигнальную вниз' : 'MACD-гистограмма отрицательна')
-    score += crossDown ? 22 : 12
-    if (r >= 38 && r <= 50) { reasons.push(`RSI ${r.toFixed(0)} — нисходящий импульс`); score += 13 }
-    else { reasons.push(`RSI ${r.toFixed(0)} в рабочей зоне`); score += 7 }
-    if (ema200 != null && close < ema200) { reasons.push(`${H.sigTf}: цена ниже EMA200`); score += 8 }
+  }
+  const volHigh = volAvg != null && fV[last] > volAvg * 1.2
+
+  // ── СКОР ПО НЕЗАВИСИМЫМ СЕМЕЙСТВАМ (каждое с потолком) ──
+  // Главная идея: EMA50 + MACD + RSI скоррелированы ~0.9 → это ОДИН фактор импульса.
+  // Раньше каждый прибавлял в общий балл (тройной счёт). Теперь — одно семейство с потолком.
+  const reasons = []
+  const cap = (v, hi) => Math.max(-hi, Math.min(hi, v))
+  const ef = H.trendOpts?.fast ?? 50
+  const es = H.trendOpts?.slow ?? 200
+
+  // 1) ТРЕНД старшего ТФ + положение к EMA200 сигнального ТФ — потолок 33
+  let fTrend = 25
+  reasons.push(`Тренд ${H.trendTf}${H.trendAggregate ? `×${H.trendAggregate}` : ''} ${side === 'long' ? 'вверх' : 'вниз'} (EMA${ef}/${es})`)
+  const ema200ok = ema200 != null && (side === 'long' ? close > ema200 : close < ema200)
+  if (ema200ok) { fTrend += 8; reasons.push(`${H.sigTf}: цена ${side === 'long' ? 'выше' : 'ниже'} EMA200`) }
+  fTrend = cap(fTrend, 33)
+
+  // 2) МОМЕНТУМ (EMA50 + MACD + RSI в ОДНО семейство) — потолок 27
+  let fMom = 9
+  reasons.push(`${H.sigTf}: импульс по EMA50`)
+  const macdStrong = side === 'long' ? crossUp : crossDown
+  fMom += macdStrong ? 12 : 7
+  reasons.push(macdStrong ? `MACD пересёк сигнальную ${side === 'long' ? 'вверх' : 'вниз'}` : 'MACD-гистограмма по тренду')
+  const rsiSweet = side === 'long' ? r >= 50 && r <= 62 : r >= 38 && r <= 50
+  fMom += rsiSweet ? 6 : 3
+  reasons.push(`RSI ${r.toFixed(0)} — ${rsiSweet ? 'здоровый импульс' : 'рабочая зона'}`)
+  fMom = cap(fMom, 27)
+
+  // 3) СИЛА/РЕЖИМ: ADX (подтверждение, НЕ дубль гейта) + согласие DI − штраф мёртвой волы — потолок 14
+  let fReg = adxv >= 28 ? 8 : adxv >= 22 ? 5 : 2
+  reasons.push(`ADX ${adxv.toFixed(0)} — ${adxv >= 28 ? 'сильный тренд' : adxv >= 22 ? 'тренд уверенный' : 'тренд подтверждён'}`)
+  const diAgree = side === 'long' ? d.plusDI > d.minusDI : d.minusDI > d.plusDI
+  if (diAgree) fReg += 3
+  if (volPct != null) {
+    if (volPct < 0.15) { fReg -= 6; reasons.push('⚠ Очень низкая волатильность — цель далеко, риск застоя') }
+    else if (volPct < 0.3) fReg -= 3
+  }
+  fReg = cap(fReg, 14)
+
+  // 4) ОБЪЁМ — потолок 8
+  let fVol = 0
+  if (volHigh) { fVol = 8; reasons.push('Объём выше среднего за 20 свечей') }
+  else if (volAvg != null && fV[last] > volAvg) fVol = 4
+
+  // 5) ОТНОСИТЕЛЬНАЯ СИЛА (кросс-секционно по вселенной) — мягкий тилт, потолок 12, без скальпа
+  let fRs = 0
+  if (rsRank != null && H.key !== 'scalp') {
+    const rel = side === 'long' ? rsRank : 1 - rsRank // лонгу — сильные монеты, шорту — слабые
+    if (rel >= 0.5) {
+      fRs = Math.round(12 * ((rel - 0.5) / 0.5))
+      if (fRs > 0) reasons.push(`Относительная сила: топ ${Math.max(1, Math.round((1 - rel) * 100))}% вселенной`)
+    }
   }
 
-  if (adxv >= 28) { reasons.push(`ADX ${adxv.toFixed(0)} — сильный тренд`); score += 12 }
-  else { reasons.push(`ADX ${adxv.toFixed(0)} — тренд подтверждён`); score += 6 }
-  if (volHigh) { reasons.push('Объём выше среднего за 20 свечей'); score += 8 }
+  let score = fTrend + fMom + fReg + fVol + fRs
 
-  // режим BTC (для скальпа влияет слабее)
+  // ── ОВЕРЛЕИ поверх базы: системный риск BTC + новости ──
   const w = H.key === 'scalp' ? 0.5 : 1
   if (side === 'long') {
-    if (btc.dir === 'down') { reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов'); score -= 10 * w }
-    else if (btc.dir === 'up') { reasons.push('BTC в восходящем тренде — попутный ветер'); score += 5 * w }
+    if (btc.dir === 'down') { score -= 12 * w; reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов') }
+    else if (btc.dir === 'up') { score += 4 * w; reasons.push('BTC в восходящем тренде — попутный ветер') }
   } else {
-    if (btc.dir === 'up') { reasons.push('⚠ BTC растёт — риск для шорта альта'); score -= 8 * w }
-    else if (btc.dir === 'down') { reasons.push('BTC слабый — поддержка шорта'); score += 5 * w }
+    if (btc.dir === 'up') { score -= 10 * w; reasons.push('⚠ BTC растёт — риск для шорта альта') }
+    else if (btc.dir === 'down') { score += 4 * w; reasons.push('BTC слабый — поддержка шорта') }
   }
 
-  // новостной фон
   let news = null
   if (newsHit) {
     news = newsHit
     if (H.key === 'veryLong') {
-      // сверхдолгосрок опирается на тренд/фундамент, а не на свежие новости — балл не трогаем
       reasons.push(`В новостях ${news.count} упоминаний — фон для справки`)
     } else {
       const against = (side === 'long' && news.sentiment === 'neg') || (side === 'short' && news.sentiment === 'pos')
       const forIt = (side === 'long' && news.sentiment === 'pos') || (side === 'short' && news.sentiment === 'neg')
-      if (against) { reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`); score -= 14 }
-      else if (forIt) { reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`); score += 6 }
-      else { reasons.push(`В новостях ${news.count} упоминаний — проверь фон`) }
+      if (against) { score -= 14; reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`) }
+      else if (forIt) { score += 6; reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`) }
+      else reasons.push(`В новостях ${news.count} упоминаний — проверь фон`)
     }
   }
 
-  score = Math.min(100, Math.round(score))
+  score = Math.min(100, Math.max(0, Math.round(score)))
   if (score < minScore) return null
 
   const slDist = atrMult * a
@@ -320,6 +367,10 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
   const sl = side === 'long' ? entry - slDist : entry + slDist
   const tp = side === 'long' ? entry + rr * slDist : entry - rr * slDist
   if (!(slDist > 0) || sl <= 0 || tp <= 0) return null
+  const riskPct = +((slDist / entry) * 100).toFixed(2)
+  // совет по размеру (inverse-vol): чтобы рисковать RISK_BUDGET_PCT% депозита,
+  // позиция = бюджет_риска / риск_сделки. Меньше риск → больше позиция.
+  const posSizePct = +Math.min(100, Math.max(1, (RISK_BUDGET_PCT / riskPct) * 100)).toFixed(1)
 
   const markets =
     H.key === 'veryLong' ? ['spot'] : H.key === 'scalp' ? ['futures'] : side === 'long' ? ['spot', 'futures'] : ['futures']
@@ -336,12 +387,22 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
     sl: round(sl),
     tp: round(tp),
     atr: round(a),
-    riskPct: +((slDist / entry) * 100).toFixed(2),
+    riskPct,
     targetPct: +(((rr * slDist) / entry) * 100).toFixed(2),
     strength: score,
+    posSizePct,
+    riskBudgetPct: RISK_BUDGET_PCT,
+    rsRank: rsRank != null ? +rsRank.toFixed(2) : null,
     etaHours: estimateEtaHours(adxv, H.tfHours, rr, atrMult),
     reasons,
-    indicators: { rsi: +r.toFixed(1), adx: +adxv.toFixed(1), macdHist: +m.hist.toPrecision(3) },
+    indicators: {
+      rsi: +r.toFixed(1),
+      adx: +adxv.toFixed(1),
+      macdHist: +m.hist.toPrecision(3),
+      plusDI: +d.plusDI.toFixed(1),
+      minusDI: +d.minusDI.toFixed(1),
+      volPct: volPct != null ? +volPct.toFixed(2) : null,
+    },
     news: news ? news.items : null,
     newsSentiment: news ? news.sentiment : null,
     newsCount: news ? news.count : 0,
@@ -354,37 +415,57 @@ function evaluateSignal(sig, candles, now) {
   const created = new Date(sig.createdAt).getTime()
   const after = closed(candles, now).filter((k) => k.t > created)
   let best = sig.side === 'long' ? -Infinity : Infinity // максимум хода в сторону прибыли (MFE)
+  let worst = sig.side === 'long' ? Infinity : -Infinity // максимум хода против сделки (MAE)
   for (const k of after) {
     if (sig.side === 'long') {
       best = Math.max(best, k.h)
-      if (k.l <= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best)
-      if (k.h >= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best)
+      worst = Math.min(worst, k.l)
+      if (k.l <= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best, worst)
+      if (k.h >= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best, worst)
     } else {
       best = Math.min(best, k.l)
-      if (k.h >= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best)
-      if (k.l <= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best)
+      worst = Math.max(worst, k.h)
+      if (k.h >= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best, worst)
+      if (k.l <= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best, worst)
     }
   }
   const maxAge = (MAX_AGE_DAYS[sig.horizon] || 12) * 864e5
   if (now - created > maxAge) {
-    const last = after.length ? after[after.length - 1] : null
-    return closeSig(sig, 'expired', last ? last.c : sig.entry, last ? last.ct : now, best)
+    const lastK = after.length ? after[after.length - 1] : null
+    return closeSig(sig, 'expired', lastK ? lastK.c : sig.entry, lastK ? lastK.ct : now, best, worst)
   }
   return null
 }
 
-function closeSig(sig, status, exit, ct, best) {
+// стоимость сделки (round-trip, % от цены) для net-метрик; фандинг не учитываем (см. FEE_RT)
+function tradeCostPct(sig, status) {
+  const venue = (sig.markets || ['futures']).includes('futures') ? 'futures' : 'spot'
+  let cost = (FEE_RT[venue] ?? FEE_RT.spot) + SLIP_RT
+  if (status === 'sl' || status === 'expired') cost += SLIP_STOP_EXTRA
+  return cost
+}
+
+function closeSig(sig, status, exit, ct, best, worst) {
   const dir = sig.side === 'long' ? 1 : -1
   const pnlPct = ((exit - sig.entry) / sig.entry) * 100 * dir
   const riskPct = sig.riskPct || (Math.abs(sig.entry - sig.sl) / sig.entry) * 100
   const durationH = +((new Date(ct).getTime() - new Date(sig.createdAt).getTime()) / 36e5).toFixed(1)
-  // какую долю пути до тейка цена прошла в лучшей точке (MFE), 0–100%
+  // доля пути до тейка в лучшей точке (MFE), 0–100%
   let toTpPct = null
   if (best != null && Number.isFinite(best)) {
     const denom = sig.side === 'long' ? sig.tp - sig.entry : sig.entry - sig.tp
     const num = sig.side === 'long' ? best - sig.entry : sig.entry - best
     if (denom > 0) toTpPct = Math.max(0, Math.min(100, Math.round((num / denom) * 100)))
   }
+  // максимальная просадка против сделки в единицах риска R (MAE)
+  let maeR = null
+  if (worst != null && Number.isFinite(worst)) {
+    const adverse = sig.side === 'long' ? sig.entry - worst : worst - sig.entry
+    if (riskPct > 0) maeR = +Math.max(0, (adverse / sig.entry) * 100 / riskPct).toFixed(2)
+  }
+  // net: вычитаем комиссию + проскальзывание (round-trip) из движения цены
+  const costPct = tradeCostPct(sig, status)
+  const netPnlPct = +(pnlPct - costPct).toFixed(2)
   return {
     ...sig,
     status,
@@ -393,29 +474,97 @@ function closeSig(sig, status, exit, ct, best) {
     durationH,
     pnlPct: +pnlPct.toFixed(2),
     r: +(pnlPct / riskPct).toFixed(2),
+    netPnlPct,
+    netR: +(netPnlPct / riskPct).toFixed(2),
+    costPct: +costPct.toFixed(2),
     toTpPct,
+    maeR,
+  }
+}
+
+const STRATUM_MIN = 50 // порог выборки (decided), ниже которого вердикт не выносим
+
+function aggStats(arr) {
+  const wins = arr.filter((s) => s.status === 'tp')
+  const losses = arr.filter((s) => s.status === 'sl')
+  const decided = wins.length + losses.length
+  const rs = arr.filter((s) => s.status !== 'expired').map((s) => s.r)
+  const netRs = arr.filter((s) => s.status !== 'expired' && s.netR != null).map((s) => s.netR)
+  const netWins = arr.filter((s) => s.status !== 'expired' && (s.netPnlPct ?? 0) > 0).length
+  const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0)
+  return {
+    closedTotal: arr.length,
+    wins: wins.length,
+    losses: losses.length,
+    decided,
+    winRate: decided ? +((wins.length / decided) * 100).toFixed(1) : 0,
+    netWinRate: decided ? +((netWins / decided) * 100).toFixed(1) : 0,
+    avgR: +mean(rs).toFixed(2),
+    avgNetR: +mean(netRs).toFixed(2),
+    totalPnlPct: +arr.reduce((a, s) => a + (s.pnlPct || 0), 0).toFixed(1),
+    totalNetPnlPct: +arr.reduce((a, s) => a + (s.netPnlPct || 0), 0).toFixed(1),
   }
 }
 
 function computeStats(open, closedArr) {
-  const wins = closedArr.filter((s) => s.status === 'tp')
-  const losses = closedArr.filter((s) => s.status === 'sl')
-  const expired = closedArr.filter((s) => s.status === 'expired')
-  const decided = wins.length + losses.length
-  const rs = closedArr.filter((s) => s.status !== 'expired').map((s) => s.r)
-  const winDur = wins.filter((s) => s.durationH != null).map((s) => s.durationH)
+  const base = aggStats(closedArr)
+  const expired = closedArr.filter((s) => s.status === 'expired').length
+  const winDur = closedArr.filter((s) => s.status === 'tp' && s.durationH != null).map((s) => s.durationH)
+  // разбивка по стратам (горизонт × сторона) с гейтом по объёму выборки
+  const strata = {}
+  for (const s of closedArr) {
+    const key = `${s.horizon || 'mid'}:${s.side}`
+    ;(strata[key] ||= []).push(s)
+  }
+  const byStratum = Object.entries(strata)
+    .map(([key, arr]) => {
+      const [horizon, side] = key.split(':')
+      const a = aggStats(arr)
+      return { horizon, side, ...a, enough: a.decided >= STRATUM_MIN }
+    })
+    .sort((x, y) => y.closedTotal - x.closedTotal)
   return {
     open: open.length,
-    closedTotal: closedArr.length,
-    wins: wins.length,
-    losses: losses.length,
-    expired: expired.length,
-    winRate: decided ? +((wins.length / decided) * 100).toFixed(1) : 0,
-    avgR: rs.length ? +(rs.reduce((a, b) => a + b, 0) / rs.length).toFixed(2) : 0,
-    totalPnlPct: +closedArr.reduce((a, s) => a + (s.pnlPct || 0), 0).toFixed(1),
+    closedTotal: base.closedTotal,
+    wins: base.wins,
+    losses: base.losses,
+    expired,
+    winRate: base.winRate,
+    netWinRate: base.netWinRate,
+    avgR: base.avgR,
+    avgNetR: base.avgNetR,
+    totalPnlPct: base.totalPnlPct,
+    totalNetPnlPct: base.totalNetPnlPct,
     avgWinDurationH: winDur.length ? +(winDur.reduce((a, b) => a + b, 0) / winDur.length).toFixed(1) : 0,
     avgEtaOpenH: open.length ? Math.round(open.reduce((a, s) => a + (s.etaHours || 0), 0) / open.length) : 0,
+    sampleGate: STRATUM_MIN,
+    byStratum,
   }
+}
+
+// Кросс-секционная относительная сила: ранжируем монеты по доходности за rsDays
+// (на закрытых свечах) внутри вселенной. Возвращаем percentile 0..1 по горизонту.
+function buildRsRanks(fetched, now) {
+  const ranks = {}
+  for (const H of HORIZONS) {
+    if (!H.rsDays) continue
+    const weekly = H.sigTf === '1w'
+    const tf = weekly ? '1w' : '1d'
+    const bars = weekly ? Math.max(2, Math.round(H.rsDays / 7)) : H.rsDays
+    const rows = []
+    for (const x of fetched) {
+      const cs = closed(x.tf[tf] || [], now).map((k) => k.c)
+      if (cs.length < bars + 1) continue
+      const a = cs[cs.length - 1 - bars]
+      const b = cs[cs.length - 1]
+      if (a > 0) rows.push({ symbol: x.symbol, ret: b / a - 1 })
+    }
+    rows.sort((p, q) => p.ret - q.ret)
+    const m = new Map()
+    rows.forEach((r, i) => m.set(r.symbol, rows.length > 1 ? i / (rows.length - 1) : 0.5))
+    ranks[H.key] = m
+  }
+  return ranks
 }
 
 async function loadPrev() {
@@ -453,6 +602,7 @@ async function main() {
   const fetched = data.filter(Boolean)
   const tfMap = { '1h': new Map(), '4h': new Map(), '1d': new Map(), '1w': new Map() }
   for (const x of fetched) for (const k of Object.keys(tfMap)) tfMap[k].set(x.symbol, x.tf[k])
+  const rsRanks = buildRsRanks(fetched, now) // относительная сила по горизонтам
   console.log(`Свечи получены: ${fetched.length}`)
 
   // 1) оценка открытых
@@ -488,7 +638,8 @@ async function main() {
   for (const x of fetched) {
     const newsHit = newsHitFn(x.base)
     for (const H of HORIZONS) {
-      const sig = analyzeHorizon(x, H, x.tf[H.sigTf], x.tf[H.trendTf], btc, newsHit, now)
+      const rs = rsRanks[H.key] ? rsRanks[H.key].get(x.symbol) : null
+      const sig = analyzeHorizon(x, H, x.tf[H.sigTf], x.tf[H.trendTf], btc, newsHit, now, rs ?? null)
       if (!sig) continue
       const key = sig.symbol + sig.side + sig.horizon
       if (openKey.has(key)) continue
@@ -512,11 +663,19 @@ async function main() {
     generatedAt: new Date(now).toISOString(),
     universeSize: fetched.length,
     btc,
-    params: { horizons: HORIZONS.map((h) => `${h.label}(${h.sigTf})`), atrMult: ATR_MULT, rr: RR, scoreMin: SCORE_MIN },
+    params: {
+      horizons: HORIZONS.map((h) => `${h.label}(${h.sigTf})`),
+      atrMult: ATR_MULT,
+      rr: RR,
+      scoreMin: SCORE_MIN,
+      costPct: { futures: FEE_RT.futures + SLIP_RT, spot: FEE_RT.spot + SLIP_RT },
+      riskBudgetPct: RISK_BUDGET_PCT,
+    },
     stats,
     open: openSorted,
     closed: closedAll,
   }
+  console.log(`Net винрейт ${stats.netWinRate}% · avgNetR ${stats.avgNetR}`)
 
   await mkdir(dirname(OUT_PATH), { recursive: true })
   await writeFile(OUT_PATH, JSON.stringify(out), 'utf8')

@@ -349,14 +349,33 @@
   color: var(--haze-dim);
   font-size: 11px;
 }
-
-/* доля пути до цели (закрытые по стопу / истёкшие) */
-.sig-mfe {
+.pnl100-size {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--haze);
+}
+.pnl100-size b {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--first-light);
+}
+
+/* доля пути до цели + просадка (закрытые по стопу / истёкшие) */
+.sig-mfe {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  align-items: baseline;
   margin-top: -4px;
+}
+.sig-mfe .mfe-v {
+  text-align: right;
 }
 .mfe-k {
   font-family: var(--sans);
@@ -487,6 +506,70 @@
 }
 .pnl.down {
   color: var(--neg);
+}
+
+/* статистика по стратам */
+.strata-wrap {
+  margin: -8px 0 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--ink-1);
+}
+.strata-wrap summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--haze);
+  list-style: none;
+}
+.strata-wrap summary::-webkit-details-marker {
+  display: none;
+}
+.strata-wrap summary::before {
+  content: '▸ ';
+  color: var(--haze-dim);
+}
+.strata-wrap[open] summary::before {
+  content: '▾ ';
+}
+.strata {
+  padding: 0 14px 12px;
+}
+.strat-row {
+  display: grid;
+  grid-template-columns: 1.6fr 0.7fr 1fr 1fr;
+  gap: 6px 10px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  align-items: baseline;
+}
+.strat-row span:not(.strat-name) {
+  text-align: right;
+}
+.strat-head {
+  border-top: none;
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--haze-dim);
+}
+.strat-name {
+  font-family: var(--sans);
+  color: var(--paper);
+}
+.strat-row .up {
+  color: var(--pos);
+}
+.strat-row .down {
+  color: var(--neg);
+}
+.strat-wait {
+  color: var(--haze-dim);
+  font-size: 11px;
 }
 
 @media (max-width: 520px) {

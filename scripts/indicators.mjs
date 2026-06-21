@@ -90,8 +90,8 @@ export function atr(highs, lows, closes, p = 14) {
   return a
 }
 
-// ADX (сила тренда) по Уайлдеру
-export function adx(highs, lows, closes, p = 14) {
+// DMI/ADX по Уайлдеру: сила тренда (ADX) + направление (+DI/-DI на последней свече)
+function _dmi(highs, lows, closes, p = 14) {
   if (closes.length < 2 * p + 1) return null
   const tr = []
   const plusDM = []
@@ -138,7 +138,19 @@ export function adx(highs, lows, closes, p = 14) {
   for (let i = 0; i < p; i++) adxv += dx[i]
   adxv /= p
   for (let i = p; i < dx.length; i++) adxv = (adxv * (p - 1) + dx[i]) / p
-  return adxv
+  const last = trS.length - 1
+  const plusDI = trS[last] ? (100 * pS[last]) / trS[last] : 0
+  const minusDI = trS[last] ? (100 * mS[last]) / trS[last] : 0
+  return { adx: adxv, plusDI, minusDI }
+}
+
+export function adx(highs, lows, closes, p = 14) {
+  const d = _dmi(highs, lows, closes, p)
+  return d ? d.adx : null
+}
+
+export function dmi(highs, lows, closes, p = 14) {
+  return _dmi(highs, lows, closes, p)
 }
 
 export function bollinger(closes, p = 20, mult = 2) {
@@ -148,4 +160,49 @@ export function bollinger(closes, p = 20, mult = 2) {
   const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / p
   const sd = Math.sqrt(variance)
   return { mid: mean, upper: mean + mult * sd, lower: mean - mult * sd, sd }
+}
+
+// Перцентиль текущей реализованной волатильности (0..1) среди скользящего окна.
+// Волатильность = std лог-доходностей за lookback свечей. Нужно, чтобы душить
+// «мёртвую волу» (низ перцентиль) и сжимать риск в экстремальной (верх перцентиль).
+export function volPercentile(closes, lookback = 14, window = 100) {
+  if (closes.length < lookback + 3) return null
+  const rets = []
+  for (let i = 1; i < closes.length; i++) rets.push(Math.log(closes[i] / closes[i - 1]))
+  const vols = []
+  for (let i = lookback; i <= rets.length; i++) {
+    const slice = rets.slice(i - lookback, i)
+    const m = slice.reduce((a, b) => a + b, 0) / lookback
+    const v = slice.reduce((a, b) => a + (b - m) ** 2, 0) / lookback
+    vols.push(Math.sqrt(v))
+  }
+  if (vols.length < 5) return null
+  const cur = vols[vols.length - 1]
+  const hist = vols.slice(-window)
+  let le = 0
+  for (const v of hist) if (v <= cur) le++
+  return le / hist.length
+}
+
+// Агрегация свечей в более крупный ТФ (например 4 недельных → «месяц»).
+// Группы выровнены по КОНЦУ ряда: последняя группа всегда завершается на последней
+// свече, незавершённый остаток в начале отбрасывается — так старший ТФ не
+// перерисовывается между прогонами (используем только полные группы).
+export function aggregate(candles, factor) {
+  if (!factor || factor <= 1) return candles
+  const out = []
+  const rem = candles.length % factor
+  for (let i = rem; i + factor <= candles.length; i += factor) {
+    const g = candles.slice(i, i + factor)
+    out.push({
+      t: g[0].t,
+      o: g[0].o,
+      h: Math.max(...g.map((k) => k.h)),
+      l: Math.min(...g.map((k) => k.l)),
+      c: g[g.length - 1].c,
+      v: g.reduce((a, k) => a + k.v, 0),
+      ct: g[g.length - 1].ct,
+    })
+  }
+  return out
 }

@@ -21,7 +21,7 @@ const OUT_PATH = resolve(ROOT, 'public', 'data', 'news.json')
 const PER_CATEGORY = 70 // сколько новостей оставляем в категории
 const MAX_AGE_HOURS = 96 // старше — отбрасываем
 const HALF_LIFE_HOURS = 20 // период полураспада «свежести»
-const SIM_THRESHOLD = 0.42 // порог Жаккара для объединения сюжетов
+const SIM_THRESHOLD = 0.28 // порог Жаккара для объединения сюжетов
 
 const parser = new Parser({
   timeout: 15000,
@@ -60,7 +60,7 @@ function normalizeTokens(title) {
       .toLowerCase()
       .replace(/[«»"'`’“”(),.:;!?\-—–\/\\|\[\]{}]/g, ' ')
       .split(/\s+/)
-      .filter((w) => w.length > 3 && !STOPWORDS.has(w)),
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w)),
   )
 }
 

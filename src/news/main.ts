@@ -273,13 +273,17 @@ function card(it: NewsItem, i: number): HTMLElement {
 }
 
 function transit(sources: number): HTMLElement {
-  const t = el('span', { class: 'transit', 'aria-hidden': 'true' })
+  const hint = `${sources} ${sources === 1 ? 'источник освещает' : sources < 5 ? 'источника освещают' : 'источников освещают'} сюжет`
+  const t = el('span', { class: 'transit', role: 'img', 'aria-label': hint, title: hint })
   renderTransit(t, sources)
   return t
 }
 function renderTransit(node: HTMLElement, sources: number) {
   const lvl = transitLevel(sources)
   node.dataset.lvl = String(lvl)
+  const hint = `${sources} ${sources === 1 ? 'источник освещает' : sources < 5 ? 'источника освещают' : 'источников освещают'} сюжет`
+  node.title = hint
+  node.setAttribute('aria-label', hint)
   node.replaceChildren()
   for (let k = 0; k < 5; k++) node.append(el('i'))
   if (sources > 1)

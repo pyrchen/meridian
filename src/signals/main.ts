@@ -116,10 +116,20 @@ function fmtDur(h: number): string {
 }
 
 // деньги от базы $100: профит$ = % хода × плечо (база ровно 100)
-const LEVS = [1, 3, 5, 10]
+const LEVS = [1, 5, 10, 25, 50]
 function money(n: number): string {
   const v = Math.abs(n)
   return (n < 0 ? '−$' : '+$') + (v >= 100 ? v.toFixed(0) : v.toFixed(1))
+}
+
+function openProgress(s: Signal): number | null {
+  const last = s.spark?.[s.spark.length - 1]
+  if (!last || !s.entry || !s.tp || s.entry === s.tp) return null
+  const p =
+    s.side === 'long'
+      ? ((last - s.entry) / (s.tp - s.entry)) * 100
+      : ((s.entry - last) / (s.entry - s.tp)) * 100
+  return Math.round(p * 10) / 10
 }
 
 async function load() {
@@ -411,6 +421,25 @@ function card(s: Signal, i: number): HTMLElement {
     eta.append(el('span', { class: 'eta-v' }, fmtDur(s.durationH || 0)))
   }
   c.append(eta)
+
+  // прогресс к цели по текущей цене (открытые)
+  if (isOpen) {
+    const prog = openProgress(s)
+    if (prog !== null) {
+      const wrap = el('div', { class: 'open-prog' })
+      const row = el('div', { class: 'open-prog-row' })
+      row.append(el('span', { class: 'mfe-k' }, 'Прогресс к цели'))
+      const cls = prog >= 100 ? ' up' : prog < 0 ? ' down' : ''
+      row.append(el('span', { class: `open-prog-val${cls}` }, `${prog}%`))
+      wrap.append(row)
+      const bar = el('div', { class: 'open-prog-bar' })
+      const fill = el('div', { class: `open-prog-fill${prog < 0 ? ' neg' : ''}` })
+      fill.style.width = `${Math.max(0, Math.min(100, prog))}%`
+      bar.append(fill)
+      wrap.append(bar)
+      c.append(wrap)
+    }
+  }
 
   // как далеко цена дошла к цели + макс. просадка до закрытия (стоп/истёкшие)
   if (!isOpen && (s.status === 'sl' || s.status === 'expired') && (s.toTpPct != null || s.maeR != null)) {

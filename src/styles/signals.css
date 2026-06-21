@@ -389,6 +389,42 @@
   color: var(--first-light);
 }
 
+/* прогресс к цели (открытые) */
+.open-prog {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.open-prog-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.open-prog-val {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--first-light);
+}
+.open-prog-val.up { color: var(--pos); }
+.open-prog-val.down { color: var(--neg); }
+.open-prog-bar {
+  height: 4px;
+  background: var(--ink-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.open-prog-fill {
+  height: 100%;
+  background: var(--pos);
+  border-radius: 999px;
+  transition: width 0.35s var(--ease-out);
+}
+.open-prog-fill.neg {
+  background: var(--neg);
+}
+
 /* бейдж горизонта */
 .hz-badge {
   font-family: var(--mono);

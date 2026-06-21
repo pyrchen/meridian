@@ -298,6 +298,78 @@
   color: var(--neg);
 }
 
+/* профит от базы $100 */
+.sig-pnl100 {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--ink-2);
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.pnl100-h {
+  font-family: var(--sans);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--haze-dim);
+}
+.pnl100-spot {
+  display: flex;
+  gap: 16px;
+  font-family: var(--mono);
+  font-size: 14px;
+}
+.pnl100-grid {
+  display: grid;
+  grid-template-columns: auto 1fr 1fr;
+  gap: 5px 14px;
+  font-family: var(--mono);
+  font-size: 13px;
+  align-items: baseline;
+}
+.pnl100-grid .th {
+  font-family: var(--sans);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--haze-dim);
+}
+.pnl100-grid .lev {
+  color: var(--paper);
+}
+.sig-pnl100 .up {
+  color: var(--pos);
+}
+.sig-pnl100 .down {
+  color: var(--neg);
+}
+.pnl100-grid .liq {
+  color: var(--haze-dim);
+  font-size: 11px;
+}
+
+/* доля пути до цели (закрытые по стопу / истёкшие) */
+.sig-mfe {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: -4px;
+}
+.mfe-k {
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--haze);
+}
+.mfe-v {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--first-light);
+}
+
 /* бейдж горизонта */
 .hz-badge {
   font-family: var(--mono);

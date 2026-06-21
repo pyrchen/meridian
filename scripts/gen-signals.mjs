@@ -32,20 +32,27 @@ const NEWS_PATH = resolve(ROOT, 'public', 'data', 'news.json')
 const BINANCE = 'https://data-api.binance.vision'
 
 const TOP_N = 100
-const SCORE_MIN = 62
+const SCORE_MIN = 70 // минимальная сила сигнала (фильтр качества)
+const RR_MIN = 2 // минимальное соотношение прибыль/риск — ниже 2:1 не сохраняем
 const ATR_MULT = 1.8
 const RR = 2.5
-const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45 } // срок жизни по горизонту
+const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // срок жизни по горизонту
 const KEEP_CLOSED = 300
 const SPARK_N = 44
 const TIMEOUT = 12000
 
+// Горизонты. rr/minScore/atrMult/trendOpts переопределяют глобальные дефолты.
+// veryLong — фундаментальный сверхдолгосрок (недельные свечи): только спот, только покупка.
 const HORIZONS = [
   { key: 'scalp', label: 'Скальп', sigTf: '1h', trendTf: '4h', tfHours: 1 },
   { key: 'mid', label: 'Средне', sigTf: '4h', trendTf: '1d', tfHours: 4 },
   { key: 'long', label: 'Долго', sigTf: '1d', trendTf: '1d', tfHours: 24 },
+  {
+    key: 'veryLong', label: 'Сверхдолго', sigTf: '1w', trendTf: '1w', tfHours: 168,
+    rr: 3, minScore: 75, atrMult: 2.2, trendOpts: { fast: 30, slow: 50, min: 60 },
+  },
 ]
-const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320 }
+const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320, '1w': 260 }
 
 const STABLES = new Set([
   'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDP', 'BUSD', 'USDD', 'EUR', 'EURI',
@@ -193,15 +200,16 @@ async function loadNewsIndex(now) {
 }
 
 // ── индикаторы / тренд ──
-function trendDir(trendClosed) {
-  if (trendClosed.length < 200) return null
+function trendDir(trendClosed, opts = {}) {
+  const { fast = 50, slow = 200, min = slow } = opts
+  if (trendClosed.length < min) return null
   const c = trendClosed.map((k) => k.c)
-  const e50 = ema(c, 50)
-  const e200 = ema(c, 200)
-  if (e50 == null || e200 == null) return null
+  const eF = ema(c, fast)
+  const eS = ema(c, slow)
+  if (eF == null || eS == null) return null
   const last = c[c.length - 1]
-  if (last > e200 && e50 > e200) return 'up'
-  if (last < e200 && e50 < e200) return 'down'
+  if (last > eS && eF > eS) return 'up'
+  if (last < eS && eF < eS) return 'down'
   return null
 }
 
@@ -212,13 +220,13 @@ function round(n) {
   return +n.toPrecision(4)
 }
 
-function estimateEtaHours(adxv, tfHours) {
+function estimateEtaHours(adxv, tfHours, rr = RR, atrMult = ATR_MULT) {
   const eff = Math.min(0.6, Math.max(0.25, 0.25 + (adxv - 18) / 120))
-  return Math.round(((RR * ATR_MULT) / eff) * tfHours)
+  return Math.round(((rr * atrMult) / eff) * tfHours)
 }
 
 function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
-  const trend = trendDir(closed(trendCandles, now))
+  const trend = trendDir(closed(trendCandles, now), H.trendOpts)
   if (!trend) return null
   const f = closed(sigCandles, now)
   if (f.length < 60) return null
@@ -238,6 +246,11 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
   if (ema50 == null || r == null || !m || a == null || adxv == null) return null
 
   const side = trend === 'up' ? 'long' : 'short'
+  if (H.key === 'veryLong' && side === 'short') return null // сверхдолгосрок — только покупка на споте
+  const rr = H.rr ?? RR
+  const atrMult = H.atrMult ?? ATR_MULT
+  const minScore = H.minScore ?? SCORE_MIN
+  if (rr < RR_MIN) return null // фильтр: соотношение прибыль/риск ниже 2:1 не сохраняем
   const crossUp = m.prevHist != null && m.prevHist <= 0 && m.hist > 0
   const crossDown = m.prevHist != null && m.prevHist >= 0 && m.hist < 0
   const volHigh = volAvg != null && fV[fV.length - 1] > volAvg * 1.2
@@ -287,23 +300,29 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
   let news = null
   if (newsHit) {
     news = newsHit
-    const against = (side === 'long' && news.sentiment === 'neg') || (side === 'short' && news.sentiment === 'pos')
-    const forIt = (side === 'long' && news.sentiment === 'pos') || (side === 'short' && news.sentiment === 'neg')
-    if (against) { reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`); score -= 14 }
-    else if (forIt) { reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`); score += 6 }
-    else { reasons.push(`В новостях ${news.count} упоминаний — проверь фон`) }
+    if (H.key === 'veryLong') {
+      // сверхдолгосрок опирается на тренд/фундамент, а не на свежие новости — балл не трогаем
+      reasons.push(`В новостях ${news.count} упоминаний — фон для справки`)
+    } else {
+      const against = (side === 'long' && news.sentiment === 'neg') || (side === 'short' && news.sentiment === 'pos')
+      const forIt = (side === 'long' && news.sentiment === 'pos') || (side === 'short' && news.sentiment === 'neg')
+      if (against) { reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`); score -= 14 }
+      else if (forIt) { reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`); score += 6 }
+      else { reasons.push(`В новостях ${news.count} упоминаний — проверь фон`) }
+    }
   }
 
   score = Math.min(100, Math.round(score))
-  if (score < SCORE_MIN) return null
+  if (score < minScore) return null
 
-  const slDist = ATR_MULT * a
+  const slDist = atrMult * a
   const entry = close
   const sl = side === 'long' ? entry - slDist : entry + slDist
-  const tp = side === 'long' ? entry + RR * slDist : entry - RR * slDist
+  const tp = side === 'long' ? entry + rr * slDist : entry - rr * slDist
   if (!(slDist > 0) || sl <= 0 || tp <= 0) return null
 
-  const markets = H.key === 'scalp' ? ['futures'] : side === 'long' ? ['spot', 'futures'] : ['futures']
+  const markets =
+    H.key === 'veryLong' ? ['spot'] : H.key === 'scalp' ? ['futures'] : side === 'long' ? ['spot', 'futures'] : ['futures']
 
   return {
     symbol: u.symbol,
@@ -318,9 +337,9 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
     tp: round(tp),
     atr: round(a),
     riskPct: +((slDist / entry) * 100).toFixed(2),
-    targetPct: +(((RR * slDist) / entry) * 100).toFixed(2),
+    targetPct: +(((rr * slDist) / entry) * 100).toFixed(2),
     strength: score,
-    etaHours: estimateEtaHours(adxv, H.tfHours),
+    etaHours: estimateEtaHours(adxv, H.tfHours, rr, atrMult),
     reasons,
     indicators: { rsi: +r.toFixed(1), adx: +adxv.toFixed(1), macdHist: +m.hist.toPrecision(3) },
     news: news ? news.items : null,
@@ -334,28 +353,38 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now) {
 function evaluateSignal(sig, candles, now) {
   const created = new Date(sig.createdAt).getTime()
   const after = closed(candles, now).filter((k) => k.t > created)
+  let best = sig.side === 'long' ? -Infinity : Infinity // максимум хода в сторону прибыли (MFE)
   for (const k of after) {
     if (sig.side === 'long') {
-      if (k.l <= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct)
-      if (k.h >= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct)
+      best = Math.max(best, k.h)
+      if (k.l <= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best)
+      if (k.h >= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best)
     } else {
-      if (k.h >= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct)
-      if (k.l <= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct)
+      best = Math.min(best, k.l)
+      if (k.h >= sig.sl) return closeSig(sig, 'sl', sig.sl, k.ct, best)
+      if (k.l <= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best)
     }
   }
   const maxAge = (MAX_AGE_DAYS[sig.horizon] || 12) * 864e5
   if (now - created > maxAge) {
     const last = after.length ? after[after.length - 1] : null
-    return closeSig(sig, 'expired', last ? last.c : sig.entry, last ? last.ct : now)
+    return closeSig(sig, 'expired', last ? last.c : sig.entry, last ? last.ct : now, best)
   }
   return null
 }
 
-function closeSig(sig, status, exit, ct) {
+function closeSig(sig, status, exit, ct, best) {
   const dir = sig.side === 'long' ? 1 : -1
   const pnlPct = ((exit - sig.entry) / sig.entry) * 100 * dir
   const riskPct = sig.riskPct || (Math.abs(sig.entry - sig.sl) / sig.entry) * 100
   const durationH = +((new Date(ct).getTime() - new Date(sig.createdAt).getTime()) / 36e5).toFixed(1)
+  // какую долю пути до тейка цена прошла в лучшей точке (MFE), 0–100%
+  let toTpPct = null
+  if (best != null && Number.isFinite(best)) {
+    const denom = sig.side === 'long' ? sig.tp - sig.entry : sig.entry - sig.tp
+    const num = sig.side === 'long' ? best - sig.entry : sig.entry - best
+    if (denom > 0) toTpPct = Math.max(0, Math.min(100, Math.round((num / denom) * 100)))
+  }
   return {
     ...sig,
     status,
@@ -364,6 +393,7 @@ function closeSig(sig, status, exit, ct) {
     durationH,
     pnlPct: +pnlPct.toFixed(2),
     r: +(pnlPct / riskPct).toFixed(2),
+    toTpPct,
   }
 }
 
@@ -412,15 +442,16 @@ async function main() {
 
   // тянем 1h/4h/1d по всем монетам
   const data = await mapLimit(universe, 8, async (u) => {
-    const [h1, h4, d1] = await Promise.all([
+    const [h1, h4, d1, w1] = await Promise.all([
       klines(u.symbol, '1h', KLINE_LIMITS['1h']),
       klines(u.symbol, '4h', KLINE_LIMITS['4h']),
       klines(u.symbol, '1d', KLINE_LIMITS['1d']),
+      klines(u.symbol, '1w', KLINE_LIMITS['1w']),
     ])
-    return { ...u, tf: { '1h': h1, '4h': h4, '1d': d1 } }
+    return { ...u, tf: { '1h': h1, '4h': h4, '1d': d1, '1w': w1 } }
   })
   const fetched = data.filter(Boolean)
-  const tfMap = { '1h': new Map(), '4h': new Map(), '1d': new Map() }
+  const tfMap = { '1h': new Map(), '4h': new Map(), '1d': new Map(), '1w': new Map() }
   for (const x of fetched) for (const k of Object.keys(tfMap)) tfMap[k].set(x.symbol, x.tf[k])
   console.log(`Свечи получены: ${fetched.length}`)
 
@@ -429,6 +460,7 @@ async function main() {
   const newlyClosed = []
   for (const sig of prev.open) {
     if (STABLES.has(sig.base)) continue // вычищаем стейблы, проскочившие в прежней схеме
+    if ((sig.strength || 0) < SCORE_MIN) continue // ниже нового порога качества — больше не держим
     let candles = tfMap[sig.timeframe || '4h']?.get(sig.symbol)
     if (!candles) {
       try { candles = await klines(sig.symbol, sig.timeframe || '4h', KLINE_LIMITS[sig.timeframe] || 330) } catch { candles = null }

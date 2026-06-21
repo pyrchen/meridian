@@ -25,7 +25,7 @@ interface Signal {
   targetPct: number
   strength: number
   etaHours: number
-  horizon?: 'scalp' | 'mid' | 'long'
+  horizon?: 'scalp' | 'mid' | 'long' | 'veryLong'
   horizonLabel?: string
   reasons: string[]
   indicators: { rsi: number; adx: number; macdHist: number }
@@ -41,6 +41,7 @@ interface Signal {
   durationH?: number
   pnlPct?: number
   r?: number
+  toTpPct?: number | null
 }
 
 interface SignalsData {
@@ -63,12 +64,12 @@ interface SignalsData {
 const state = {
   data: null as SignalsData | null,
   mode: 'futures' as 'futures' | 'spot',
-  horizon: 'all' as 'all' | 'scalp' | 'mid' | 'long',
+  horizon: 'all' as 'all' | 'scalp' | 'mid' | 'long' | 'veryLong',
   status: 'open' as 'open' | 'closed' | 'all',
   query: '',
 }
 
-function hz(s: Signal): 'scalp' | 'mid' | 'long' {
+function hz(s: Signal): 'scalp' | 'mid' | 'long' | 'veryLong' {
   return s.horizon || 'mid'
 }
 
@@ -83,7 +84,16 @@ function fmtDur(h: number): string {
   if (!h || h <= 0) return '—'
   if (h < 24) return `${Math.round(h)} ч`
   const d = h / 24
-  return `${d < 10 ? d.toFixed(1) : Math.round(d)} дн`
+  if (d < 30) return `${d < 10 ? d.toFixed(1) : Math.round(d)} дн`
+  const mo = d / 30.44
+  return `${mo < 10 ? mo.toFixed(1) : Math.round(mo)} мес`
+}
+
+// деньги от базы $100: профит$ = % хода × плечо (база ровно 100)
+const LEVS = [1, 3, 5, 10]
+function money(n: number): string {
+  const v = Math.abs(n)
+  return (n < 0 ? '−$' : '+$') + (v >= 100 ? v.toFixed(0) : v.toFixed(1))
 }
 
 async function load() {
@@ -104,8 +114,9 @@ function scoped(): Signal[] {
   if (!d) return []
   let list: Signal[] =
     state.status === 'open' ? d.open : state.status === 'closed' ? d.closed : [...d.open, ...d.closed]
-  // Фьючерсы — лонг и шорт; Спот — только покупка (лонг), без скальпа (спот = хранение)
-  if (state.mode === 'spot') list = list.filter((s) => s.side === 'long' && hz(s) !== 'scalp')
+  // Рынок берём из markets сигнала: фьючерсы — всё с 'futures'; спот — всё с 'spot'
+  // (сверхдолгосрок — только спот, скальп — только фьючерсы).
+  list = list.filter((s) => (s.markets || ['futures']).includes(state.mode))
   if (state.horizon !== 'all') list = list.filter((s) => hz(s) === state.horizon)
   const q = state.query.trim().toLowerCase()
   if (q) list = list.filter((s) => s.base.toLowerCase().includes(q))
@@ -154,28 +165,31 @@ function baseByStatus(): Signal[] {
 function renderControls() {
   const d = state.data!
   const base = baseByStatus()
-  const spotList = base.filter((s) => s.side === 'long' && hz(s) !== 'scalp')
+  const spotList = base.filter((s) => (s.markets || ['futures']).includes('spot'))
+  const futuresList = base.filter((s) => (s.markets || ['futures']).includes('futures'))
 
   seg(
     $('tabs'),
     [
-      { key: 'futures', label: 'Фьючерсы', n: base.length },
+      { key: 'futures', label: 'Фьючерсы', n: futuresList.length },
       { key: 'spot', label: 'Спот · покупка', n: spotList.length },
     ],
     state.mode,
     (k) => {
       state.mode = k as typeof state.mode
       if (state.mode === 'spot' && state.horizon === 'scalp') state.horizon = 'all'
+      if (state.mode === 'futures' && state.horizon === 'veryLong') state.horizon = 'all'
       renderControls()
       renderGrid()
     },
   )
 
-  const modeList = state.mode === 'spot' ? spotList : base
+  const modeList = state.mode === 'spot' ? spotList : futuresList
   const n = (k: string) => modeList.filter((s) => hz(s) === k).length
   const hzItems: { key: string; label: string; n?: number }[] = [{ key: 'all', label: 'Все' }]
   if (state.mode === 'futures') hzItems.push({ key: 'scalp', label: 'Скальп', n: n('scalp') })
   hzItems.push({ key: 'mid', label: 'Средне', n: n('mid') }, { key: 'long', label: 'Долго', n: n('long') })
+  if (state.mode === 'spot') hzItems.push({ key: 'veryLong', label: 'Сверхдолго', n: n('veryLong') })
   seg($('hz'), hzItems, state.horizon, (k) => {
     state.horizon = k as typeof state.horizon
     renderControls()
@@ -280,7 +294,12 @@ function card(s: Signal, i: number): HTMLElement {
   } else {
     head.append(el('span', { class: `badge ${s.side}` }, s.side === 'long' ? 'Лонг' : 'Шорт'))
   }
-  const hzLabels: Record<string, string> = { scalp: 'Скальп · 1ч', mid: 'Средне · 4ч', long: 'Долго · 1д' }
+  const hzLabels: Record<string, string> = {
+    scalp: 'Скальп · 1ч',
+    mid: 'Средне · 4ч',
+    long: 'Долго · 1д',
+    veryLong: 'Сверхдолго · 1н',
+  }
   head.append(el('span', { class: 'hz-badge' }, hzLabels[hz(s)]))
   const str = el('div', { class: 'sig-strength' })
   str.append(el('b', {}, String(s.strength)))
@@ -298,6 +317,9 @@ function card(s: Signal, i: number): HTMLElement {
   lv.append(levelCell(spot ? 'Цель' : 'Тейк', fmtPrice(s.tp), `+${s.targetPct}%`, 'tp'))
   c.append(lv)
 
+  // профит от базы $100 (спот — без плеча, фьючерсы — по плечам)
+  c.append(profitBlock(s, spot))
+
   // прогноз срока / факт
   const eta = el('div', { class: 'sig-eta' })
   if (isOpen) {
@@ -314,6 +336,14 @@ function card(s: Signal, i: number): HTMLElement {
     eta.append(el('span', { class: 'eta-v' }, fmtDur(s.durationH || 0)))
   }
   c.append(eta)
+
+  // как далеко цена дошла к цели до закрытия (для стопа/истёкших)
+  if (!isOpen && (s.status === 'sl' || s.status === 'expired') && s.toTpPct != null) {
+    const mfe = el('div', { class: 'sig-mfe' })
+    mfe.append(el('span', { class: 'mfe-k' }, 'Дошёл до цели'))
+    mfe.append(el('span', { class: 'mfe-v' }, `${s.toTpPct}%`))
+    c.append(mfe)
+  }
 
   // причины
   const why = el('ul', { class: 'sig-why' })
@@ -354,6 +384,34 @@ function levelCell(label: string, value: string, sub: string, cls = ''): HTMLEle
   d.append(el('b', {}, value))
   if (sub) d.append(document.createTextNode(' '), el('em', {}, sub))
   return d
+}
+
+// профит/убыток от базы $100. Спот — 1× без плеча; фьючерсы — таблица по плечам.
+// При плече L: профит$ = targetPct × L, убыток$ = riskPct × L. Если riskPct × L ≥ 100 —
+// стоп лежит за ликвидацией (позицию вынесет раньше), помечаем «ликвид.».
+function profitBlock(s: Signal, spot: boolean): HTMLElement {
+  const wrap = el('div', { class: 'sig-pnl100' })
+  const tgt = s.targetPct || 0
+  const rsk = s.riskPct || 0
+  if (spot) {
+    wrap.append(el('div', { class: 'pnl100-h' }, 'Со $100 на споте'))
+    const row = el('div', { class: 'pnl100-spot' })
+    row.append(el('span', { class: 'up' }, 'к цели ' + money(tgt)))
+    row.append(el('span', { class: 'down' }, 'к защите ' + money(-rsk)))
+    wrap.append(row)
+    return wrap
+  }
+  wrap.append(el('div', { class: 'pnl100-h' }, 'Профит со $100 · плечо'))
+  const grid = el('div', { class: 'pnl100-grid' })
+  grid.append(el('span', { class: 'th' }, 'Плечо'), el('span', { class: 'th' }, 'Цель'), el('span', { class: 'th' }, 'Стоп'))
+  for (const L of LEVS) {
+    grid.append(el('span', { class: 'lev' }, L + '×'))
+    grid.append(el('span', { class: 'up' }, money(tgt * L)))
+    if (rsk * L >= 100) grid.append(el('span', { class: 'down liq' }, 'ликвид.'))
+    else grid.append(el('span', { class: 'down' }, money(-rsk * L)))
+  }
+  wrap.append(grid)
+  return wrap
 }
 
 function showEmpty(msg: string) {

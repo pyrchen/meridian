@@ -1,3 +1,24 @@
+/* ── расширяем макет только для страницы сигналов ── */
+.term .wrap {
+  --maxw: 1640px;
+}
+
+/* кнопка переключения темы */
+.sig-theme-btn {
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line-2);
+  background: var(--ink-2);
+  cursor: pointer;
+  transition: background 0.18s, border-color 0.18s;
+}
+.sig-theme-btn:hover {
+  background: var(--ink-3);
+  border-color: var(--first-light);
+}
+
 /* ── фильтры ── */
 .filters2 {
   display: flex;
@@ -82,8 +103,8 @@
 /* ── сетка карточек ── */
 .sig-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 16px;
   padding-bottom: 8px;
 }
 .sig-card {
@@ -91,11 +112,16 @@
   border: 1px solid var(--line);
   border-left-width: 3px;
   border-radius: var(--radius);
-  padding: 16px 18px;
+  padding: 18px 20px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 13px;
   animation: rise 0.45s var(--ease-out) backwards;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.sig-card:hover {
+  border-color: var(--line-2);
+  box-shadow: 0 4px 24px -8px rgba(0,0,0,0.35);
 }
 .sig-card.long {
   border-left-color: var(--pos);
@@ -783,11 +809,10 @@
   .sig-grid {
     grid-template-columns: 1fr;
   }
-  .search2 {
-    margin-left: 0;
-    width: 100%;
+  .filters2 {
+    gap: 8px;
   }
-  .search2 input {
-    width: 100%;
+  .filters2-sub {
+    gap: 8px;
   }
 }

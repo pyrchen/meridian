@@ -733,6 +733,23 @@ function inspector(s: Signal): HTMLElement {
   return wrap
 }
 
+function initThemeToggle() {
+  const btn = document.getElementById('sig-theme-btn') as HTMLButtonElement
+  const html = document.documentElement
+  const sync = () => {
+    const light = html.dataset.theme === 'light'
+    btn.textContent = light ? '🌙' : '☀️'
+    btn.title = light ? 'Тёмная тема' : 'Светлая тема'
+  }
+  btn.onclick = () => {
+    const next = html.dataset.theme === 'light' ? 'dark' : 'light'
+    html.dataset.theme = next
+    try { localStorage.setItem('meridian-theme', next) } catch {}
+    sync()
+  }
+  sync()
+}
+
 function showEmpty(msg: string) {
   const e = $('empty')
   e.hidden = false
@@ -747,6 +764,8 @@ function setLive() {
 function tick() {
   load().then(setLive)
 }
+
+initThemeToggle()
 
 setupGate(() => {
   $('app').hidden = false

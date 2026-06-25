@@ -221,20 +221,70 @@ function renderAll() {
   renderGrid()
 }
 
+function inPeriod(s: Signal): boolean {
+  if (state.period === 'all') return true
+  const age = Date.now() - new Date(s.createdAt).getTime()
+  const DAY = 86_400_000
+  if (state.period === 'day') return age <= DAY
+  if (state.period === 'week') return age <= 7 * DAY
+  if (state.period === 'lastweek') return age > 7 * DAY && age <= 14 * DAY
+  if (state.period === 'month') return age <= 30 * DAY
+  return true
+}
+
+function avg(arr: number[]): number {
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+}
+
+function computePeriodStats() {
+  const d = state.data!
+  if (state.period === 'all') return d.stats
+
+  const openF = d.open.filter(inPeriod)
+  const closedF = d.closed.filter(inPeriod)
+  const decided = closedF.filter((s) => s.status === 'tp' || s.status === 'sl')
+  const wins = decided.filter((s) => s.status === 'tp')
+  const losses = decided.filter((s) => s.status === 'sl')
+  const netWins = decided.filter((s) => (s.netR ?? s.r ?? 0) > 0)
+
+  const round1 = (v: number) => Math.round(v * 10) / 10
+  const round2 = (v: number) => Math.round(v * 100) / 100
+
+  const winRate = decided.length ? round1((wins.length / decided.length) * 100) : 0
+  const netWinRate = decided.length ? round1((netWins.length / decided.length) * 100) : 0
+  const avgR = round2(avg(decided.map((s) => s.r ?? 0)))
+  const avgNetR = round2(avg(decided.map((s) => s.netR ?? s.r ?? 0)))
+  const avgWinDurationH = avg(wins.map((s) => s.durationH ?? 0).filter((v) => v > 0))
+  const avgEtaOpenH = avg(openF.map((s) => s.etaHours).filter((v) => v > 0)) || d.stats.avgEtaOpenH
+
+  return {
+    open: openF.length,
+    closedTotal: closedF.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate,
+    netWinRate,
+    avgR,
+    avgNetR,
+    avgWinDurationH,
+    avgEtaOpenH,
+    sampleGate: d.stats.sampleGate,
+    byStratum: undefined as typeof d.stats.byStratum,
+  }
+}
+
 function renderStats() {
-  const s = state.data!.stats
-  // винрейт и R показываем НЕТТО (после комиссий+проскальзывания) — честный ориентир,
-  // брутто прячем в подсказку
+  const s = computePeriodStats()
+  const isPeriod = state.period !== 'all'
   const netWr = s.netWinRate ?? s.winRate
   const wr = $('s-winrate')
   wr.textContent = `${netWr}%`
-  wr.title = `брутто ${s.winRate}% · нетто учитывает комиссию + проскальзывание`
+  wr.title = isPeriod
+    ? `период: ${state.period} · брутто ${s.winRate}%`
+    : `брутто ${s.winRate}% · нетто учитывает комиссию + проскальзывание`
   setLabel(wr, 'винрейт нетто')
   $('s-open').textContent = String(s.open)
-  // фактический средний срок до тейка, пока нет закрытых — прогноз по открытым
-  $('s-eta').textContent = s.avgWinDurationH
-    ? fmtDur(s.avgWinDurationH)
-    : '≈' + fmtDur(s.avgEtaOpenH)
+  $('s-eta').textContent = s.avgWinDurationH ? fmtDur(s.avgWinDurationH) : '≈' + fmtDur(s.avgEtaOpenH)
   const netR = s.avgNetR ?? s.avgR
   const ar = $('s-avgr')
   ar.textContent = (netR >= 0 ? '+' : '') + netR + 'R'
@@ -242,7 +292,7 @@ function renderStats() {
   setLabel(ar, 'средний R нетто')
   $('s-closed').textContent = `${s.wins} / ${s.losses}`
   $('s-universe').textContent = String(state.data!.universeSize)
-  renderStrata()
+  renderStrata(s.byStratum)
 }
 
 function setLabel(valueEl: HTMLElement, text: string) {
@@ -251,11 +301,11 @@ function setLabel(valueEl: HTMLElement, text: string) {
 }
 
 // разбивка по стратам (горизонт × сторона): нетто-винрейт/R, с гейтом по выборке
-function renderStrata() {
+function renderStrata(byStratum?: Stratum[]) {
   const host = document.getElementById('strata')
   if (!host) return
   const s = state.data!.stats
-  const rows = (s.byStratum || []).filter((r) => r.closedTotal > 0)
+  const rows = (byStratum ?? s.byStratum ?? []).filter((r) => r.closedTotal > 0)
   if (!rows.length) {
     host.replaceChildren()
     return
@@ -385,6 +435,7 @@ function renderControls() {
     state.period,
     (k) => {
       state.period = k as typeof state.period
+      renderStats()
       renderControls()
       renderGrid()
     },

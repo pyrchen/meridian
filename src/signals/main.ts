@@ -21,8 +21,12 @@ interface Signal {
   entry: number
   sl: number
   tp: number
+  tp2?: number
+  tp3?: number | null
+  atr?: number
   riskPct: number
   targetPct: number
+  rr?: number
   strength: number
   etaHours: number
   posSizePct?: number
@@ -37,7 +41,7 @@ interface Signal {
   newsCount?: number
   spark?: number[]
   scoreBreakdown?: {
-    trend: number; momentum: number; regime: number; volume: number; rs: number
+    trend: number; momentum: number; regime: number; volume: number; rs: number; smc?: number
     btc: number; news: number; base: number; total: number
   }
   cohortWeek?: string
@@ -96,9 +100,11 @@ const state = {
   data: null as SignalsData | null,
   mode: 'futures' as 'futures' | 'spot',
   horizon: 'all' as 'all' | 'scalp' | 'mid' | 'long' | 'veryLong',
-  status: 'open' as 'open' | 'closed' | 'all',
+  status: 'open' as 'open' | 'closed' | 'tp' | 'sl' | 'expired',
   query: '',
   prices: new Map<string, number>(),
+  sort: 'strength' as 'strength' | 'created',
+  period: 'all' as 'all' | 'day' | 'week' | 'lastweek' | 'month',
 }
 
 function hz(s: Signal): 'scalp' | 'mid' | 'long' | 'veryLong' {
@@ -111,6 +117,14 @@ function fmtPrice(n: number): string {
   if (n >= 1) return n.toFixed(4)
   if (n >= 0.01) return n.toFixed(6)
   return n.toPrecision(4)
+}
+function fmtDate(iso: string): string {
+  const d = new Date(iso)
+  const dd = String(d.getDate()).padStart(2, '0')
+  const mo = String(d.getMonth() + 1).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${dd}.${mo} ${hh}:${mm}`
 }
 function fmtDur(h: number): string {
   if (!h || h <= 0) return '—'
@@ -172,14 +186,35 @@ async function load() {
 function scoped(): Signal[] {
   const d = state.data
   if (!d) return []
-  let list: Signal[] =
-    state.status === 'closed' ? d.closed : d.open
-  // Рынок берём из markets сигнала: фьючерсы — всё с 'futures'; спот — всё с 'spot'
-  // (сверхдолгосрок — только спот, скальп — только фьючерсы).
+  let list: Signal[]
+  if (state.status === 'open') {
+    list = [...d.open]
+  } else if (state.status === 'tp' || state.status === 'sl' || state.status === 'expired') {
+    list = d.closed.filter((s) => s.status === state.status)
+  } else {
+    list = [...d.closed]
+  }
   list = list.filter((s) => (s.markets || ['futures']).includes(state.mode))
   if (state.horizon !== 'all') list = list.filter((s) => hz(s) === state.horizon)
   const q = state.query.trim().toLowerCase()
   if (q) list = list.filter((s) => s.base.toLowerCase().includes(q))
+  if (state.period !== 'all') {
+    const now = Date.now()
+    const DAY = 86_400_000
+    list = list.filter((s) => {
+      const age = now - new Date(s.createdAt).getTime()
+      if (state.period === 'day') return age <= DAY
+      if (state.period === 'week') return age <= 7 * DAY
+      if (state.period === 'lastweek') return age > 7 * DAY && age <= 14 * DAY
+      if (state.period === 'month') return age <= 30 * DAY
+      return true
+    })
+  }
+  list.sort((a, b) =>
+    state.sort === 'created'
+      ? new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      : b.strength - a.strength,
+  )
   return list
 }
 
@@ -268,7 +303,11 @@ function seg(
 
 function baseByStatus(): Signal[] {
   const d = state.data!
-  return state.status === 'closed' ? d.closed : d.open
+  if (state.status === 'open') return d.open
+  if (state.status === 'tp') return d.closed.filter((s) => s.status === 'tp')
+  if (state.status === 'sl') return d.closed.filter((s) => s.status === 'sl')
+  if (state.status === 'expired') return d.closed.filter((s) => s.status === 'expired')
+  return d.closed
 }
 
 function renderControls() {
@@ -305,16 +344,49 @@ function renderControls() {
     renderGrid()
   })
 
+  const tpN = d.closed.filter((s) => s.status === 'tp').length
+  const slN = d.closed.filter((s) => s.status === 'sl').length
   seg(
     $('sides'),
     [
       { key: 'open', label: 'Открытые', n: d.open.length },
       { key: 'closed', label: 'Закрытые', n: d.closed.length },
+      { key: 'tp', label: 'Тейк ✓', n: tpN },
+      { key: 'sl', label: 'Стоп ✗', n: slN },
     ],
-    state.status === 'all' ? 'open' : state.status,
+    state.status,
     (k) => {
       state.status = k as typeof state.status
       renderControls()
+      renderGrid()
+    },
+  )
+
+  seg(
+    $('sort'),
+    [
+      { key: 'strength', label: 'По силе' },
+      { key: 'created', label: 'По дате' },
+    ],
+    state.sort,
+    (k) => {
+      state.sort = k as typeof state.sort
+      renderGrid()
+    },
+  )
+
+  seg(
+    $('period'),
+    [
+      { key: 'all', label: 'Все' },
+      { key: 'day', label: 'День' },
+      { key: 'week', label: 'Неделя' },
+      { key: 'lastweek', label: 'Прош. нед' },
+      { key: 'month', label: 'Месяц' },
+    ],
+    state.period,
+    (k) => {
+      state.period = k as typeof state.period
       renderGrid()
     },
   )
@@ -425,6 +497,18 @@ function card(s: Signal, i: number): HTMLElement {
   lv.append(levelCell(spot ? 'Цель' : 'Тейк', fmtPrice(s.tp), `+${s.targetPct}%`, 'tp'))
   c.append(lv)
 
+  // доп. цели для частичной фиксации (если рассчитаны движком)
+  if (s.tp2) {
+    const tps = el('div', { class: 'sig-tps' })
+    tps.append(el('span', { class: 'sig-tps-k' }, 'Частичная фиксация'))
+    const row = el('div', { class: 'sig-tps-row' })
+    row.append(el('b', {}, 'TP2 ' + fmtPrice(s.tp2)))
+    if (s.tp3) row.append(el('b', {}, 'TP3 ' + fmtPrice(s.tp3)))
+    if (s.rr) row.append(el('span', { class: 'sig-tps-rr' }, `R:R ${s.rr}:1`))
+    tps.append(row)
+    c.append(tps)
+  }
+
   // профит от базы $100 (спот — без плеча, фьючерсы — по плечам)
   c.append(profitBlock(s, spot))
 
@@ -501,7 +585,7 @@ function card(s: Signal, i: number): HTMLElement {
   // подвал
   const foot = el('div', { class: 'sig-foot' })
   if (isOpen) {
-    foot.append(el('span', {}, `сигнал ${timeAgo(s.createdAt)}`))
+    foot.append(el('span', { class: 'sig-date', title: timeAgo(s.createdAt) }, fmtDate(s.createdAt)))
     foot.append(el('span', { class: 'mkt' }, `RSI ${s.indicators.rsi} · ADX ${s.indicators.adx}`))
   } else {
     const label = s.status === 'tp' ? 'Тейк' : s.status === 'sl' ? 'Стоп' : 'Истёк'
@@ -591,6 +675,7 @@ function inspector(s: Signal): HTMLElement {
       ['ADX / волатильность', bd.regime, 14, bd.regime < 0 ? 'neg' : ''],
       ['Объём', bd.volume, 8, ''],
       ['Относит. сила', bd.rs, 12, ''],
+      ['Smart Money', bd.smc ?? 0, 10, ''],
       ['BTC режим', bd.btc, 12, bd.btc < 0 ? 'neg' : bd.btc > 0 ? 'pos' : 'zero'],
       ['Новости', bd.news, 14, bd.news < 0 ? 'neg' : bd.news > 0 ? 'pos' : 'zero'],
     ]

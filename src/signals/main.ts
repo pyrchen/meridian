@@ -527,16 +527,16 @@ function card(s: Signal, i: number): HTMLElement {
     const prog = openProgress(s)
     if (last != null && s.entry) {
       const wrap = el('div', { class: 'open-prog' })
-      const rawPct = Math.round(((last - s.entry) / s.entry) * 10000) / 100
-      const favorable = s.side === 'long' ? rawPct : -rawPct
-      const dollarAbs = Math.abs(rawPct)
+      const rawPct = ((last - s.entry) / s.entry) * 100
+      const favorable = Math.round((s.side === 'long' ? rawPct : -rawPct) * 100) / 100
+      const dollarAbs = Math.abs(favorable)
       const dollarStr = dollarAbs >= 10 ? dollarAbs.toFixed(1) : dollarAbs.toFixed(2)
       const dollarSign = favorable >= 0 ? '+' : '−'
-      const pctSign = rawPct >= 0 ? '+' : ''
+      const pctSign = favorable >= 0 ? '+' : ''
       const pctCls = favorable > 0 ? ' up' : favorable < 0 ? ' down' : ''
       const pr = el('div', { class: 'open-prog-row' })
       pr.append(el('span', { class: 'mfe-k' }, 'Цена от входа'))
-      pr.append(el('span', { class: `open-prog-val${pctCls}` }, `${pctSign}${rawPct}% (${dollarSign}$${dollarStr})`))
+      pr.append(el('span', { class: `open-prog-val${pctCls}` }, `${pctSign}${favorable}% (${dollarSign}$${dollarStr})`))
       wrap.append(pr)
       if (prog !== null) {
         const row = el('div', { class: 'open-prog-row' })

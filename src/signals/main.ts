@@ -529,21 +529,35 @@ function card(s: Signal, i: number): HTMLElement {
   }
   c.append(eta)
 
-  // прогресс к цели по текущей цене (открытые)
+  // прогресс к цели + цена от входа по текущей цене (открытые)
   if (isOpen) {
+    const last = state.prices.get(s.symbol) ?? s.spark?.[s.spark.length - 1]
     const prog = openProgress(s)
-    if (prog !== null) {
+    if (last != null && s.entry) {
       const wrap = el('div', { class: 'open-prog' })
-      const row = el('div', { class: 'open-prog-row' })
-      row.append(el('span', { class: 'mfe-k' }, 'Прогресс к цели'))
-      const cls = prog >= 100 ? ' up' : prog < 0 ? ' down' : ''
-      row.append(el('span', { class: `open-prog-val${cls}` }, `${prog}%`))
-      wrap.append(row)
-      const bar = el('div', { class: 'open-prog-bar' })
-      const fill = el('div', { class: `open-prog-fill${prog < 0 ? ' neg' : ''}` })
-      fill.style.width = `${Math.max(0, Math.min(100, prog))}%`
-      bar.append(fill)
-      wrap.append(bar)
+      const rawPct = Math.round(((last - s.entry) / s.entry) * 10000) / 100
+      const favorable = s.side === 'long' ? rawPct : -rawPct
+      const dollarAbs = Math.abs(rawPct)
+      const dollarStr = dollarAbs >= 10 ? dollarAbs.toFixed(1) : dollarAbs.toFixed(2)
+      const dollarSign = favorable >= 0 ? '+' : '−'
+      const pctSign = rawPct >= 0 ? '+' : ''
+      const pctCls = favorable > 0 ? ' up' : favorable < 0 ? ' down' : ''
+      const pr = el('div', { class: 'open-prog-row' })
+      pr.append(el('span', { class: 'mfe-k' }, 'Цена от входа'))
+      pr.append(el('span', { class: `open-prog-val${pctCls}` }, `${pctSign}${rawPct}% (${dollarSign}$${dollarStr})`))
+      wrap.append(pr)
+      if (prog !== null) {
+        const row = el('div', { class: 'open-prog-row' })
+        row.append(el('span', { class: 'mfe-k' }, 'Прогресс к цели'))
+        const cls = prog >= 100 ? ' up' : prog < 0 ? ' down' : ''
+        row.append(el('span', { class: `open-prog-val${cls}` }, `${prog}%`))
+        wrap.append(row)
+        const bar = el('div', { class: 'open-prog-bar' })
+        const fill = el('div', { class: `open-prog-fill${prog < 0 ? ' neg' : ''}` })
+        fill.style.width = `${Math.max(0, Math.min(100, prog))}%`
+        bar.append(fill)
+        wrap.append(bar)
+      }
       c.append(wrap)
     }
   }

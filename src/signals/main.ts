@@ -101,7 +101,6 @@ const state = {
   mode: 'futures' as 'futures' | 'spot',
   horizon: 'all' as 'all' | 'scalp' | 'mid' | 'long' | 'veryLong',
   status: 'open' as 'open' | 'closed' | 'tp' | 'sl' | 'expired',
-  query: '',
   prices: new Map<string, number>(),
   sort: 'strength' as 'strength' | 'created',
   period: 'all' as 'all' | 'day' | 'week' | 'lastweek' | 'month',
@@ -196,8 +195,6 @@ function scoped(): Signal[] {
   }
   list = list.filter((s) => (s.markets || ['futures']).includes(state.mode))
   if (state.horizon !== 'all') list = list.filter((s) => hz(s) === state.horizon)
-  const q = state.query.trim().toLowerCase()
-  if (q) list = list.filter((s) => s.base.toLowerCase().includes(q))
   if (state.period !== 'all') {
     const now = Date.now()
     const DAY = 86_400_000
@@ -371,6 +368,7 @@ function renderControls() {
     state.sort,
     (k) => {
       state.sort = k as typeof state.sort
+      renderControls()
       renderGrid()
     },
   )
@@ -387,17 +385,10 @@ function renderControls() {
     state.period,
     (k) => {
       state.period = k as typeof state.period
+      renderControls()
       renderGrid()
     },
   )
-
-  const q = $('q') as HTMLInputElement
-  if (!q.oninput) {
-    q.oninput = (e) => {
-      state.query = (e.target as HTMLInputElement).value
-      renderGrid()
-    }
-  }
 }
 
 function renderGrid() {
@@ -405,7 +396,7 @@ function renderGrid() {
   const items = scoped()
   if (!items.length) {
     grid.replaceChildren()
-    showEmpty(state.query ? 'Ничего не найдено.' : 'В этой вкладке пока пусто.')
+    showEmpty('В этой вкладке пока пусто.')
     return
   }
   $('empty').hidden = true
@@ -494,7 +485,8 @@ function card(s: Signal, i: number): HTMLElement {
   const lv = el('div', { class: 'sig-levels' })
   lv.append(levelCell(spot ? 'Покупка' : 'Вход', fmtPrice(s.entry), ''))
   lv.append(levelCell(spot ? 'Защита' : 'Стоп', fmtPrice(s.sl), `−${s.riskPct}%`, 'sl'))
-  lv.append(levelCell(spot ? 'Цель' : 'Тейк', fmtPrice(s.tp), `+${s.targetPct}%`, 'tp'))
+  const rrStr = s.rr ? ` · R:R ${s.rr}` : ''
+  lv.append(levelCell(spot ? 'Цель' : 'Тейк', fmtPrice(s.tp), `+${s.targetPct}%${rrStr}`, 'tp'))
   c.append(lv)
 
   // доп. цели для частичной фиксации (если рассчитаны движком)

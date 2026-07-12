@@ -13,6 +13,9 @@ dist-ssr
 data/history
 data/backtest
 
+# X10-исполнитель: локальный стейт/журнал виртуального банкролла (data/x10/state.json)
+data/x10
+
 # Секреты (Bybit demo и пр.) — никогда не коммитим
 .env
 .env.*

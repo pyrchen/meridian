@@ -13,6 +13,11 @@ dist-ssr
 data/history
 data/backtest
 
+# Секреты (Bybit demo и пр.) — никогда не коммитим
+.env
+.env.*
+!.env.example
+
 # Editor
 .vscode/*
 !.vscode/extensions.json

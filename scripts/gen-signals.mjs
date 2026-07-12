@@ -79,7 +79,18 @@ const TIMEOUT = 12000
 export const FEE_RT = { futures: 0.1, spot: 0.2 } // тейкерская комиссия туда-обратно
 export const SLIP_RT = 0.06 // консервативное проскальзывание round-trip
 const SLIP_STOP_EXTRA = 0.05 // добавка на проскальзывание по стопу/истечению (гэп)
-const RISK_BUDGET_PCT = 1 // риск на сделку для совета по размеру (% депозита)
+// Портфельный совет по размеру ставки (валидировано банкролл-бэктестом 2026-07-12,
+// scripts/bankroll.mjs: train/holdout + адверсариальная верификация). Ядро портфеля —
+// mid (риск 2% капитала; эдж +0.14R подтверждён на обеих вселенных) и long (1%, выборка
+// тонкая). Скальпы нетто-эджа после комиссий не показали — витрина, не портфель;
+// veryLong — n=3. ВАЖНО: CI годовой доходности ядра включает ноль — это совет по
+// размеру ставки, не обещание прибыли.
+const PORTFOLIO = {
+  mid: { riskPct: 2, grade: 'core' },
+  long: { riskPct: 1, grade: 'core' },
+  scalp: { riskPct: 0.5, grade: 'showcase' },
+  veryLong: { riskPct: 0.5, grade: 'showcase' },
+}
 export const QV_MIN = 1.5e6 // минимальный 24ч объём ($) — отсев неликвидного хвоста (стоп нельзя ставить в шум)
 export const MIN_TARGET_PCT = 0.5 // нижний порог цели (%): меньше — нетто-стоимость съедает прибыль (см. net-учёт)
 
@@ -539,9 +550,15 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
   // доп. цели для частичной фиксации (информативно; статистика по основному tp)
   const tp2 = round(side === 'long' ? entry + (rr + 1.5) * slDist : entry - (rr + 1.5) * slDist)
   const tp3 = null // Phase 1 (P1-1): score≥85 tp3-расширение снято вместе со score→rr ладдером
-  // совет по размеру (inverse-vol): чтобы рисковать RISK_BUDGET_PCT% депозита,
+  // совет по размеру (inverse-vol): чтобы рисковать pf.riskPct% депозита,
   // позиция = бюджет_риска / риск_сделки. Меньше риск → больше позиция.
-  const posSizePct = +Math.min(100, Math.max(1, (RISK_BUDGET_PCT / riskPct) * 100)).toFixed(1)
+  const pf = PORTFOLIO[H.key] || { riskPct: 1, grade: 'showcase' }
+  const posSizePct = +Math.min(100, Math.max(1, (pf.riskPct / riskPct) * 100)).toFixed(1)
+  reasons.push(
+    pf.grade === 'core'
+      ? `Портфель: разумная ставка — риск ${pf.riskPct}% капитала (ядро, валидировано 5-летним бэктестом)`
+      : `Портфель: вне валидированного ядра — нетто-эдж после комиссий не подтверждён; не более ${pf.riskPct}% капитала`,
+  )
 
   const markets =
     H.key === 'veryLong' ? ['spot'] : H.key === 'scalp' ? ['futures'] : side === 'long' ? ['spot', 'futures'] : ['futures']
@@ -565,7 +582,8 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
     rr: +rr.toFixed(2),
     strength: score,
     posSizePct,
-    riskBudgetPct: RISK_BUDGET_PCT,
+    riskBudgetPct: pf.riskPct,
+    portfolioGrade: pf.grade,
     rsRank: rsRank != null ? +rsRank.toFixed(2) : null,
     etaHours: estimateEtaHours(adxv, H.tfHours, rr, atrMult),
     reasons,
@@ -864,7 +882,7 @@ async function main() {
       adxGateScalp: ADX_GATE_SCALP,
       suppressFlatShort: SUPPRESS_FLAT_SHORT,
       costPct: { futures: FEE_RT.futures + SLIP_RT, spot: FEE_RT.spot + SLIP_RT },
-      riskBudgetPct: RISK_BUDGET_PCT,
+      portfolio: PORTFOLIO,
     },
     stats,
     open: openSorted,

@@ -27,14 +27,26 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
 const HIST_DIR = resolve(ROOT, 'data', 'history')
 const BT_DIR = resolve(ROOT, 'data', 'backtest')
-const SYMBOLS_META = resolve(HIST_DIR, '_symbols.json')
-const TRADES_PATH = resolve(BT_DIR, 'trades.json')
-const AUDIT_PATH = resolve(BT_DIR, 'audit.json')
-const REPORT_PATH = resolve(BT_DIR, 'report.json')
+// ── экспериментальные вселенные (--tag=t30 --top=30): отдельный снапшот символов и
+// отдельные выходные файлы; кэш свечей в data/history общий (дедуп по open-time).
+// БЕЗ флагов поведение бит-в-бит прежнее — основная 12-символьная цепочка не трогается.
+const argvEarly = process.argv.slice(2)
+function earlyFlag(name) {
+  const hit = argvEarly.find((a) => a.startsWith(`--${name}=`))
+  return hit ? hit.slice(name.length + 3) : undefined
+}
+const TAG = earlyFlag('tag') ? `-${earlyFlag('tag')}` : ''
+
+const SYMBOLS_META = resolve(HIST_DIR, `_symbols${TAG}.json`)
+const TRADES_PATH = resolve(BT_DIR, `trades${TAG}.json`)
+const AUDIT_PATH = resolve(BT_DIR, `audit${TAG}.json`)
+const REPORT_PATH = resolve(BT_DIR, `report${TAG}.json`)
 
 const BINANCE = 'https://data-api.binance.vision'
 const PULL_INTERVALS = ['1h', '4h', '1d', '1w']
-const UNIVERSE_TOP_N = 12 // снапшот вселенной для бэктеста — компактно, не 100 как в live
+// снапшот вселенной для бэктеста — по умолчанию компактные 12 (не 100 как в live);
+// --top=N переопределяет для тегированных экспериментов.
+const UNIVERSE_TOP_N = earlyFlag('top') ? Number(earlyFlag('top')) : 12
 
 const STABLES = new Set([
   'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDP', 'BUSD', 'USDD', 'EUR', 'EURI',

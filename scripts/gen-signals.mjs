@@ -19,7 +19,7 @@
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ema, rsi, macd, atr, dmi, sma, volPercentile, aggregate } from './indicators.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -32,40 +32,79 @@ const NEWS_PATH = resolve(ROOT, 'public', 'data', 'news.json')
 const BINANCE = 'https://data-api.binance.vision'
 
 const TOP_N = 100
-const SCORE_MIN = 70 // минимальная сила сигнала (фильтр качества)
-const RR_MIN = 2 // минимальное соотношение прибыль/риск — ниже 2:1 не сохраняем
-const ATR_MULT = 1.8
-const RR = 2.5
-const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // срок жизни по горизонту
+// Phase 1 (P1-2/P1-6): скор сжат до трёх семейств (fTrend 33 + fReg 14 + fRs 12 ≈ 59 макс
+// вместо ~104 раньше; у scalp нет fRs совсем → потолок ~44) — SCORE_MIN пересчитан харнессом
+// на новой шкале, свип {35,40,42,45,48,50} на data/history (см. data/backtest/report.json):
+//   35→avgNetR−0.08(n7816) · 40→−0.07(n5787) · 42→−0.05(n3931) · 45→−0.01(n908, НО scalp=0!)
+//   48→−0.03(n700, scalp=0) · 50→−0.01(n524, scalp=0)
+// ВАЖНО: 45/48/50 математически убивают scalp (её потолок скора ~44 < 45 — нет fRs-семейства,
+// это тот же P1-6 «critical coupling» баг, только на уровне одного горизонта, а не всего
+// движка). scalp — 198/371 (53%) исторического потока сигналов; такое SCORE_MIN нарушало бы
+// guardrail 5 (floor-check). Выбрано 42 — лучший avgNetR среди значений, не морящих ни один
+// горизонт/regime-срез (все страты scalp/mid остаются «enough», n≥STRATUM_MIN).
+// SCORE_MIN_OVERRIDE позволяет свипать харнессом без правки файла (backtest.mjs).
+export const SCORE_MIN = Number(process.env.SCORE_MIN_OVERRIDE) || 42 // минимальная сила сигнала (фильтр качества)
+export const RR_MIN = 2 // минимальное соотношение прибыль/риск — ниже 2:1 не сохраняем
+export const ATR_MULT = 1.8
+export const RR = 2.5
+export const RR_CAP = 2.5 // Phase 1 (P1-1): жёсткий потолок RR — было score≥80/85/90 → 3/4/6
+export const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // срок жизни по горизонту
+
+// Маркер движка. Каждый сигнал, произведённый ЭТИМ движком (Phase 0 офлайн-харнесс + Phase 1
+// перестройка скора), несёт поле `engine` — чтобы «новые» сигналы отличались от старых по
+// ЯВНОМУ штампу, а не по косвенной эвристике «есть поле rr» (как в old/new-абляции roadmap).
+// Валидация: офлайн-бэктест-харнесс на ~3 годах истории, lookahead-аудит PASS
+// (data/backtest/audit.json). Абляция pooled avgNetR, ПОДТВЕРЖДЕНА реплеем под openKey-дедупом:
+// −0.09 (старый) → −0.05 (Phase 1) → +0.037 (Phase 2 ADX35) → +0.046 (Phase 2 scalp≥38).
+// Плюс в обоих backtestable-режимах (up/down по +0.054), WR 32%; 90% CI [−0.05,+0.15] — точечная
+// оценка плюсовая, ноль не исключён (survivorship-bias односторонне оптимистичен). Это ЧЕСТНОЕ
+// ПЛАТО: pooled avgNetR держит скальп (76% потока, край +0.012); край +0.5 недостижим — требовал
+// бы WR ~43% при rr2.5 против факт. ~32%, такого края в индикаторах нет. См. docs/SIGNAL_REDESIGN_PLAN.md.
+export const ENGINE = 'v2-harness'
+export const ENGINE_ONLINE_AT = '2026-07-12' // дата вывода харнесс-валидированного движка в онлайн
+
+export const ADX_GATE = Number(process.env.ADX_GATE_OVERRIDE) || 35 // Phase 2 (P2-2): entry ADX floor (mid/long/veryLong); harness plateau 34–38, было 18
+// Скальп (1ч) шумнее — планка ADX выше. Харнесс-свип-2: scalp≥38 поднял pooled avgNetR
+// +0.037→+0.062 при плюсе во всех режимах BTC; scalp≥40 ломает flat (−0.10). Пер-горизонтный
+// гейт вместо глобального — принципиально: чем короче ТФ, тем сильнее нужен тренд для входа.
+export const ADX_GATE_SCALP = Number(process.env.ADX_GATE_SCALP_OVERRIDE) || 38
+export const SUPPRESS_FLAT_SHORT = process.env.SUPPRESS_FLAT_SHORT !== '0' // Phase 2 (P2-4): нет шортов при BTC=flat (flat-shorts avgNetR −0.484)
+
 const KEEP_CLOSED = 1500 // держим больше закрытых — нужно для будущей калибровки/валидации
 const SPARK_N = 44
 const TIMEOUT = 12000
 
 // Стоимость сделки (round-trip, % от номинала) — для честных net-метрик.
 // Фьючерс-фандинг НЕ учитываем: fapi гео-блокнут (451) с US-раннеров CI, зеркала нет.
-const FEE_RT = { futures: 0.1, spot: 0.2 } // тейкерская комиссия туда-обратно
-const SLIP_RT = 0.06 // консервативное проскальзывание round-trip
+export const FEE_RT = { futures: 0.1, spot: 0.2 } // тейкерская комиссия туда-обратно
+export const SLIP_RT = 0.06 // консервативное проскальзывание round-trip
 const SLIP_STOP_EXTRA = 0.05 // добавка на проскальзывание по стопу/истечению (гэп)
 const RISK_BUDGET_PCT = 1 // риск на сделку для совета по размеру (% депозита)
-const QV_MIN = 1.5e6 // минимальный 24ч объём ($) — отсев неликвидного хвоста (стоп нельзя ставить в шум)
-const MIN_TARGET_PCT = 0.5 // нижний порог цели (%): меньше — нетто-стоимость съедает прибыль (см. net-учёт)
+export const QV_MIN = 1.5e6 // минимальный 24ч объём ($) — отсев неликвидного хвоста (стоп нельзя ставить в шум)
+export const MIN_TARGET_PCT = 0.5 // нижний порог цели (%): меньше — нетто-стоимость съедает прибыль (см. net-учёт)
 
 // Горизонты. rr/minScore/atrMult/trendOpts/rsDays/trendAggregate переопределяют дефолты.
 // Соотношение сигнального и трендового ТФ держим 4–7× (не 1×), чтобы фильтр был
 // действительно старше сигнала и не дублировал тот же ряд:
 //   • long   — вход 1d, тренд недельный
 //   • veryLong — вход 1w, тренд «месячный» (агрегируем 4 недели в свечу)
-const HORIZONS = [
+export const HORIZONS = [
   { key: 'scalp', label: 'Скальп', sigTf: '1h', trendTf: '4h', tfHours: 1 },
   { key: 'mid', label: 'Средне', sigTf: '4h', trendTf: '1d', tfHours: 4, rsDays: 7 },
   { key: 'long', label: 'Долго', sigTf: '1d', trendTf: '1w', tfHours: 24, rsDays: 21, trendOpts: { fast: 20, slow: 50, min: 55 } },
   {
+    // Phase 1 (P1-1): rr3 — доказанно проигрышный тир (rr3→WR5.7%), приведено к RR_CAP.
+    // minScore-оверрайд (75) снят: он был откалиброван под старый максимум скора (~104);
+    // на сжатой шкале (~59, см. SCORE_MIN выше) 75 недостижимо в принципе — это тот же
+    // P1-6 «critical coupling» баг, только для veryLong, а не для глобального SCORE_MIN.
+    // Оставлять его означало бы тихо занулить горизонт навсегда. Горизонт использует общий
+    // SCORE_MIN (harness-selected) наравне с mid/long.
     key: 'veryLong', label: 'Сверхдолго', sigTf: '1w', trendTf: '1w', tfHours: 168,
-    rr: 3, minScore: 75, atrMult: 2.2, rsDays: 60,
+    rr: 2.5, atrMult: 2.2, rsDays: 60,
     trendAggregate: 4, trendOpts: { fast: 6, slow: 12, min: 18 },
   },
 ]
-const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320, '1w': 260 }
+export const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320, '1w': 260 }
 
 const STABLES = new Set([
   'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDP', 'BUSD', 'USDD', 'EUR', 'EURI',
@@ -142,16 +181,23 @@ async function buildUniverse() {
 }
 
 // ── режим BTC ──
+// Чистая функция: считает режим по уже закрытым дневным свечам BTC. Вынесена из
+// btcRegime(now), чтобы backtest.mjs мог прогнать её AS-OF любого T без сети (P0-1/P0-4).
+export function btcRegimeFrom(closedDailyBtc) {
+  const c = closedDailyBtc.map((k) => k.c)
+  const e50 = ema(c, 50)
+  const e200 = ema(c, 200)
+  const last = c[c.length - 1]
+  const dir = last > e200 && e50 > e200 ? 'up' : last < e200 && e50 < e200 ? 'down' : 'flat'
+  const wk = c.length > 7 ? ((last - c[c.length - 8]) / c[c.length - 8]) * 100 : 0
+  return { dir, change7d: +wk.toFixed(1) }
+}
+
+// Тонкая обёртка с сетью/IO — единственное место, где btcRegime трогает fetch.
 async function btcRegime(now) {
   try {
     const d = closed(await klines('BTCUSDT', '1d', 320), now)
-    const c = d.map((k) => k.c)
-    const e50 = ema(c, 50)
-    const e200 = ema(c, 200)
-    const last = c[c.length - 1]
-    const dir = last > e200 && e50 > e200 ? 'up' : last < e200 && e50 < e200 ? 'down' : 'flat'
-    const wk = c.length > 7 ? ((last - c[c.length - 8]) / c[c.length - 8]) * 100 : 0
-    return { dir, change7d: +wk.toFixed(1) }
+    return btcRegimeFrom(d)
   } catch {
     return { dir: 'flat', change7d: 0 }
   }
@@ -248,17 +294,11 @@ function estimateEtaHours(adxv, tfHours, rr = RR, atrMult = ATR_MULT) {
   return Math.round(((rr * atrMult) / eff) * tfHours)
 }
 
-// Динамический RR по силе сигнала. Оптимизируем ЭКСПЕКТАЦИЮ (avgR), не винрейт:
-// выше RR ⇒ механически ниже WR, но выше прибыль на сделку. Капы по горизонту —
-// чтобы цель оставалась физически достижимой (скальп на 1ч-свечах не тянет 6R).
-function dynamicRR(score, horizonKey, baseRR = RR) {
-  if (horizonKey === 'veryLong') return Math.max(3.0, baseRR)
-  let rr = baseRR
-  if (score >= 90) rr = 6.0
-  else if (score >= 85) rr = 4.0
-  else if (score >= 80) rr = 3.0
-  const cap = { scalp: 3.0, mid: 4.0, long: 6.0 }[horizonKey] ?? 4.0
-  return Math.min(rr, cap)
+// Phase 1 (P1-1): убит score→rr ладдер (был фатальным дефектом — rr3→WR5.7%, rr4→WR0%,
+// z=−4.83 по разделению победа/проигрыш). RR больше не зависит от conviction/score —
+// фиксированный потолок RR_CAP для всех горизонтов и всех score.
+function dynamicRR(baseRR = RR) {
+  return Math.min(baseRR, RR_CAP)
 }
 
 // ── Smart Money Concepts (структурное подтверждение, на ЗАКРЫТЫХ свечах) ──
@@ -316,7 +356,7 @@ function liquiditySweep(candles, side, lookback = 20) {
 // Калибровка по закрытым сделкам: что отличало выигрыши от проигрышей в каждой
 // страте (горизонт×сторона). Используется для адаптивного подъёма minScore там, где
 // исторический WR низкий и выборка достаточна. Только повышаем планку — консервативно.
-function calibrateFromClosed(closedArr) {
+export function calibrateFromClosed(closedArr) {
   const byStratum = {}
   for (const s of closedArr) {
     if (s.status === 'expired') continue
@@ -327,20 +367,15 @@ function calibrateFromClosed(closedArr) {
   for (const [key, { wins, losses }] of Object.entries(byStratum)) {
     const decided = wins.length + losses.length
     if (decided < 30) continue
-    const avg = (arr, fn) => (arr.length ? arr.reduce((s, x) => s + fn(x), 0) / arr.length : 0)
     out[key] = {
       decided,
       wr: +((wins.length / decided) * 100).toFixed(1),
-      winAvgRsi: +avg(wins, (x) => x.indicators?.rsi || 0).toFixed(1),
-      lossAvgRsi: +avg(losses, (x) => x.indicators?.rsi || 0).toFixed(1),
-      winAvgStrength: +avg(wins, (x) => x.strength || 0).toFixed(1),
-      lossAvgStrength: +avg(losses, (x) => x.strength || 0).toFixed(1),
     }
   }
   return out
 }
 
-function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRank, calib) {
+export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRank, calib) {
   // тренд старшего ТФ (для veryLong агрегируем недели в «месяцы» — реальное 4× разделение)
   let tc = closed(trendCandles, now)
   if (H.trendAggregate) tc = aggregate(tc, H.trendAggregate)
@@ -368,23 +403,35 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
 
   const side = trend === 'up' ? 'long' : 'short'
   if (H.key === 'veryLong' && side === 'short') return null // сверхдолгосрок — только покупка на споте
+  // Phase 2 (P2-1): long:short убит. На ~3 годах харнесса он отрицателен во ВСЕХ режимах BTC
+  // (down −0.26 / flat −1.02 / up −0.41 avgNetR) — критерий 8 плана требует занулить шорт-путь,
+  // не дающий OOS avgNetR ≥ 0 хотя бы в одном non-down режиме. Долгосрочный шорт на спот-
+  // горизонте — «падающий нож». См. data/backtest/report.json (strata long|short|*).
+  if (H.key === 'long' && side === 'short') return null
+  // Phase 2 (P2-4): нет шортов при BTC=flat/chop — на харнессе flat-шорты дали avgNetR −0.484
+  // (чистый яд), уборка их — самый большой единичный вклад в положительный pooled avgNetR.
+  if (SUPPRESS_FLAT_SHORT && side === 'short' && btc.dir === 'flat') return null
   const baseRR = H.rr ?? RR
   const atrMult = H.atrMult ?? ATR_MULT
   let minScore = H.minScore ?? SCORE_MIN
   if (baseRR < RR_MIN) return null // фильтр: соотношение прибыль/риск ниже 2:1 не сохраняем
 
-  // адаптивный порог: страты с плохим историческим WR (выборка ≥ STRATUM_MIN) поднимают планку
+  // адаптивный порог: страты с плохим историческим WR (выборка ≥ STRATUM_MIN) поднимают планку.
+  // Phase 1: бонус (+5/+8) откалиброван под старую шкалу скора (макс ~104); на сжатой шкале
+  // (макс ~59) та же прибавка — намного агрессивнее пропорционально. Отключено/инертно до
+  // P4-3 (avgNetR-aware re-baseline на новой шкале) — не хотим искажать SCORE_MIN-свип Phase 1.
+  const ADAPTIVE_BUMP_ENABLED = false
   const cal = calib && calib[`${H.key}:${side}`]
-  if (cal && cal.decided >= STRATUM_MIN && cal.wr < 70) minScore += cal.wr < 50 ? 8 : 5
+  if (ADAPTIVE_BUMP_ENABLED && cal && cal.decided >= STRATUM_MIN && cal.wr < 70) minScore += cal.wr < 50 ? 8 : 5
 
   // ── обязательные условия входа (гейты) ──
-  const crossUp = m.prevHist != null && m.prevHist <= 0 && m.hist > 0
-  const crossDown = m.prevHist != null && m.prevHist >= 0 && m.hist < 0
   // RSI сужен до momentum-зоны (было 45–68/32–55): режем слабый импульс и перекупленность/перепроданность
+  // пер-горизонтный ADX-гейт: скальп (шумный 1ч) требует более сильного тренда, чем mid/long
+  const adxGate = H.key === 'scalp' ? ADX_GATE_SCALP : ADX_GATE
   if (side === 'long') {
-    if (!(close > ema50) || !(m.hist > 0) || !(r >= 50 && r <= 65) || adxv < 18) return null
+    if (!(close > ema50) || !(m.hist > 0) || !(r >= 50 && r <= 65) || adxv < adxGate) return null
   } else {
-    if (!(close < ema50) || !(m.hist < 0) || !(r >= 35 && r <= 50) || adxv < 18) return null
+    if (!(close < ema50) || !(m.hist < 0) || !(r >= 35 && r <= 50) || adxv < adxGate) return null
   }
   // наклон EMA50 должен совпадать с направлением (тренд ускоряется, не разворачивается)
   const ema50prev = ema(fC.slice(0, -3), 50)
@@ -396,11 +443,11 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
   if (Math.abs(close - ema50) > 3 * a) return null
   // объёмный пол для коротких ТФ: нет участия — нет интереса рынка к продолжению
   if ((H.key === 'scalp' || H.key === 'mid') && volAvg != null && fV[last] < volAvg * 0.7) return null
-  const volHigh = volAvg != null && fV[last] > volAvg * 1.2
 
-  // ── СКОР ПО НЕЗАВИСИМЫМ СЕМЕЙСТВАМ (каждое с потолком) ──
-  // Главная идея: EMA50 + MACD + RSI скоррелированы ~0.9 → это ОДИН фактор импульса.
-  // Раньше каждый прибавлял в общий балл (тройной счёт). Теперь — одно семейство с потолком.
+  // ── СКОР (Phase 1, P1-2): momentum/volume/SMC/news сняты с суммы — на данных они не
+  // дискриминировали победителей (RSI z≈−0.01, MACD z≈+0.03, volume z=−1.15, news z=+0.10;
+  // SMC-«вред» — mixed-engine confound). MACD-sign/RSI-band/EMA50 остаются гейтами входа выше
+  // (unchanged), 0.7×-объём и QV_MIN — гейтами ликвидности (unchanged). score = fTrend+fReg+fRs.
   const reasons = []
   const cap = (v, hi) => Math.max(-hi, Math.min(hi, v))
   const ef = H.trendOpts?.fast ?? 50
@@ -413,18 +460,7 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
   if (ema200ok) { fTrend += 8; reasons.push(`${H.sigTf}: цена ${side === 'long' ? 'выше' : 'ниже'} EMA200`) }
   fTrend = cap(fTrend, 33)
 
-  // 2) МОМЕНТУМ (EMA50 + MACD + RSI в ОДНО семейство) — потолок 27
-  let fMom = 9
-  reasons.push(`${H.sigTf}: импульс по EMA50`)
-  const macdStrong = side === 'long' ? crossUp : crossDown
-  fMom += macdStrong ? 12 : 7
-  reasons.push(macdStrong ? `MACD пересёк сигнальную ${side === 'long' ? 'вверх' : 'вниз'}` : 'MACD-гистограмма по тренду')
-  const rsiSweet = side === 'long' ? r >= 50 && r <= 62 : r >= 38 && r <= 50
-  fMom += rsiSweet ? 6 : 3
-  reasons.push(`RSI ${r.toFixed(0)} — ${rsiSweet ? 'здоровый импульс' : 'рабочая зона'}`)
-  fMom = cap(fMom, 27)
-
-  // 3) СИЛА/РЕЖИМ: ADX (подтверждение, НЕ дубль гейта) + согласие DI − штраф мёртвой волы — потолок 14
+  // 2) СИЛА/РЕЖИМ: ADX (подтверждение, НЕ дубль гейта) + согласие DI − штраф мёртвой волы — потолок 14
   let fReg = adxv >= 28 ? 8 : adxv >= 22 ? 5 : 2
   reasons.push(`ADX ${adxv.toFixed(0)} — ${adxv >= 28 ? 'сильный тренд' : adxv >= 22 ? 'тренд уверенный' : 'тренд подтверждён'}`)
   const diAgree = side === 'long' ? d.plusDI > d.minusDI : d.minusDI > d.plusDI
@@ -435,12 +471,7 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
   }
   fReg = cap(fReg, 14)
 
-  // 4) ОБЪЁМ — потолок 8
-  let fVol = 0
-  if (volHigh) { fVol = 8; reasons.push('Объём выше среднего за 20 свечей') }
-  else if (volAvg != null && fV[last] > volAvg) fVol = 4
-
-  // 5) ОТНОСИТЕЛЬНАЯ СИЛА (кросс-секционно по вселенной) — мягкий тилт, потолок 12, без скальпа
+  // 3) ОТНОСИТЕЛЬНАЯ СИЛА (кросс-секционно по вселенной) — мягкий тилт, потолок 12, без скальпа
   let fRs = 0
   if (rsRank != null && H.key !== 'scalp') {
     const rel = side === 'long' ? rsRank : 1 - rsRank // лонгу — сильные монеты, шорту — слабые
@@ -450,29 +481,28 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
     }
   }
 
-  // 6) SMART MONEY: структурное подтверждение (Order Block / FVG / снятие ликвидности) — потолок 10.
-  // Мягкий тилт ПОВЕРХ гейтов: не создаёт сделку в обход обязательных условий, только усиливает скор
-  // (и через него — RR-тир). Кандидат уже прошёл все структурные гейты выше.
-  let fSmc = 0
-  if (findOrderBlock(f, side)) { fSmc += 8; reasons.push('Smart Money: цена в Order Block (зона институционального интереса)') }
-  if (findFVG(f, side)) { fSmc += 6; reasons.push('Smart Money: закрытие Fair Value Gap (имбаланс цены)') }
-  if (liquiditySweep(f, side)) { fSmc += 5; reasons.push('Smart Money: снятие ликвидности перед входом') }
-  fSmc = Math.min(10, fSmc)
+  let score = fTrend + fReg + fRs
 
-  let score = fTrend + fMom + fReg + fVol + fRs + fSmc
+  // ── ДИСПЛЕЙ-ОНЛИ (Phase 1, P1-2): Smart Money / BTC-режим — больше не дают очков, только
+  // информационные reasons. SMC снят из скора для parsimony (мнимый «вред» 14.7% vs 26.0% WR —
+  // mixed-engine confound, не гейт). BTC-оверлей был mis-signed в выборке (z=−2.29, +4 short-
+  // tailwind поднимал проигрышные шорты) — полноценная side-symmetric suppression замена —
+  // Phase 2 (P2-4, НЕ в этой фазе), здесь просто не начисляем очки.
+  if (findOrderBlock(f, side)) reasons.push('Smart Money: цена в Order Block (зона институционального интереса)')
+  if (findFVG(f, side)) reasons.push('Smart Money: закрытие Fair Value Gap (имбаланс цены)')
+  if (liquiditySweep(f, side)) reasons.push('Smart Money: снятие ликвидности перед входом')
 
-  // ── ОВЕРЛЕИ поверх базы: системный риск BTC + новости ──
-  const w = H.key === 'scalp' ? 0.5 : 1
-  let btcDelta = 0
   if (side === 'long') {
-    if (btc.dir === 'down') { btcDelta = -12 * w; score += btcDelta; reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов') }
-    else if (btc.dir === 'up') { btcDelta = 4 * w; score += btcDelta; reasons.push('BTC в восходящем тренде — попутный ветер') }
+    if (btc.dir === 'down') reasons.push('⚠ BTC в нисходящем тренде — риск для лонгов альтов')
+    else if (btc.dir === 'up') reasons.push('BTC в восходящем тренде — попутный ветер')
   } else {
-    if (btc.dir === 'up') { btcDelta = -10 * w; score += btcDelta; reasons.push('⚠ BTC растёт — риск для шорта альта') }
-    else if (btc.dir === 'down') { btcDelta = 4 * w; score += btcDelta; reasons.push('BTC слабый — поддержка шорта') }
+    if (btc.dir === 'up') reasons.push('⚠ BTC растёт — риск для шорта альта')
+    else if (btc.dir === 'down') reasons.push('BTC слабый — поддержка шорта')
   }
-  let newsDelta = 0
 
+  // новости (Phase 1, P1-2): единственный оставшийся эффект — жёсткое вето «против сделки»
+  // (было −14 к скору). «За» сделку — только инфо-строка, очков не даёт (было +6; news z=+0.10 —
+  // шум, к тому же unreplayable в харнессе — нет point-in-time архива).
   let news = null
   if (newsHit) {
     news = newsHit
@@ -480,9 +510,9 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
       reasons.push(`В новостях ${news.count} упоминаний — фон для справки`)
     } else {
       const against = (side === 'long' && news.sentiment === 'neg') || (side === 'short' && news.sentiment === 'pos')
+      if (against) return null // жёсткое вето: новостной фон против сделки
       const forIt = (side === 'long' && news.sentiment === 'pos') || (side === 'short' && news.sentiment === 'neg')
-      if (against) { newsDelta = -14; score += newsDelta; reasons.push(`⚠ Новостной фон против сделки (${news.count} упоминаний)`) }
-      else if (forIt) { newsDelta = 6; score += newsDelta; reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`) }
+      if (forIt) reasons.push(`Новостной фон поддерживает (${news.count} упоминаний)`)
       else reasons.push(`В новостях ${news.count} упоминаний — проверь фон`)
     }
   }
@@ -490,13 +520,12 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
   score = Math.min(100, Math.max(0, Math.round(score)))
   if (score < minScore) return null
 
-  // динамический RR по conviction: сильнее сигнал → шире цель → выше avgR (ценой WR)
-  const rr = dynamicRR(score, H.key, baseRR)
+  // Phase 1 (P1-1): RR больше не зависит от score/conviction — фиксированный потолок RR_CAP.
+  const rr = dynamicRR(baseRR)
 
   const scoreBreakdown = {
-    trend: fTrend, momentum: fMom, regime: fReg, volume: fVol, rs: fRs, smc: fSmc,
-    btc: Math.round(btcDelta), news: newsDelta,
-    base: fTrend + fMom + fReg + fVol + fRs + fSmc, total: score,
+    trend: fTrend, regime: fReg, rs: fRs,
+    base: fTrend + fReg + fRs, total: score,
   }
 
   const slDist = atrMult * a
@@ -509,7 +538,7 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
   if (targetPct < MIN_TARGET_PCT) return null // цель меньше нетто-порога — отбраковываем
   // доп. цели для частичной фиксации (информативно; статистика по основному tp)
   const tp2 = round(side === 'long' ? entry + (rr + 1.5) * slDist : entry - (rr + 1.5) * slDist)
-  const tp3 = score >= 85 ? round(side === 'long' ? entry + (rr + 4) * slDist : entry - (rr + 4) * slDist) : null
+  const tp3 = null // Phase 1 (P1-1): score≥85 tp3-расширение снято вместе со score→rr ладдером
   // совет по размеру (inverse-vol): чтобы рисковать RISK_BUDGET_PCT% депозита,
   // позиция = бюджет_риска / риск_сделки. Меньше риск → больше позиция.
   const posSizePct = +Math.min(100, Math.max(1, (RISK_BUDGET_PCT / riskPct) * 100)).toFixed(1)
@@ -554,11 +583,12 @@ function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRan
     spark: fC.slice(-SPARK_N).map((x) => round(x)),
     scoreBreakdown,
     cohortWeek: isoWeek(now),
+    engine: ENGINE,
   }
 }
 
 // ── оценка исхода ──
-function evaluateSignal(sig, candles, now) {
+export function evaluateSignal(sig, candles, now) {
   const created = new Date(sig.createdAt).getTime()
   const after = closed(candles, now).filter((k) => k.t > created)
   let best = sig.side === 'long' ? -Infinity : Infinity // максимум хода в сторону прибыли (MFE)
@@ -585,14 +615,14 @@ function evaluateSignal(sig, candles, now) {
 }
 
 // стоимость сделки (round-trip, % от цены) для net-метрик; фандинг не учитываем (см. FEE_RT)
-function tradeCostPct(sig, status) {
+export function tradeCostPct(sig, status) {
   const venue = (sig.markets || ['futures']).includes('futures') ? 'futures' : 'spot'
   let cost = (FEE_RT[venue] ?? FEE_RT.spot) + SLIP_RT
   if (status === 'sl' || status === 'expired') cost += SLIP_STOP_EXTRA
   return cost
 }
 
-function closeSig(sig, status, exit, ct, best, worst) {
+export function closeSig(sig, status, exit, ct, best, worst) {
   const dir = sig.side === 'long' ? 1 : -1
   const pnlPct = ((exit - sig.entry) / sig.entry) * 100 * dir
   const riskPct = sig.riskPct || (Math.abs(sig.entry - sig.sl) / sig.entry) * 100
@@ -629,9 +659,9 @@ function closeSig(sig, status, exit, ct, best, worst) {
   }
 }
 
-const STRATUM_MIN = 50 // порог выборки (decided), ниже которого вердикт не выносим
+export const STRATUM_MIN = 50 // порог выборки (decided), ниже которого вердикт не выносим
 
-function aggStats(arr) {
+export function aggStats(arr) {
   const wins = arr.filter((s) => s.status === 'tp')
   const losses = arr.filter((s) => s.status === 'sl')
   const decided = wins.length + losses.length
@@ -653,7 +683,7 @@ function aggStats(arr) {
   }
 }
 
-function computeStats(open, closedArr) {
+export function computeStats(open, closedArr) {
   const base = aggStats(closedArr)
   const expired = closedArr.filter((s) => s.status === 'expired').length
   const winDur = closedArr.filter((s) => s.status === 'tp' && s.durationH != null).map((s) => s.durationH)
@@ -691,7 +721,7 @@ function computeStats(open, closedArr) {
 
 // Кросс-секционная относительная сила: ранжируем монеты по доходности за rsDays
 // (на закрытых свечах) внутри вселенной. Возвращаем percentile 0..1 по горизонту.
-function buildRsRanks(fetched, now) {
+export function buildRsRanks(fetched, now) {
   const ranks = {}
   for (const H of HORIZONS) {
     if (!H.rsDays) continue
@@ -816,12 +846,23 @@ async function main() {
     generatedAt: new Date(now).toISOString(),
     universeSize: fetched.length,
     btc,
+    engine: {
+      version: ENGINE,
+      online: true,
+      onlineAt: ENGINE_ONLINE_AT,
+      basis: 'harness',
+      gates: { adxGate: ADX_GATE, adxGateScalp: ADX_GATE_SCALP, suppressFlatShort: SUPPRESS_FLAT_SHORT, rrCap: RR_CAP },
+      note: 'Новый движок в онлайне, валидирован офлайн-бэктест-харнессом (~3г истории, lookahead-аудит PASS). Phase 1: убит score→rr ладдер, скор сжат до trend+regime+rs. Phase 2: ADX-гейт 18→35 (скальп→38, шумный 1ч), нет шортов при BTC=flat, long:short убит. Подтверждённая реплеем абляция pooled avgNetR: −0.09 (старый) → −0.05 (Phase 1) → +0.046 (v2, close/next-open совпали), WR 32%, оба значимых режима BTC +0.054. Край mid +0.14 / long +0.30, скальп +0.01 (76% потока — держит pooled). Честная оговорка: 90% CI [−0.05,+0.15] — точечная оценка плюсовая, ноль статистически не исключён (survivorship-bias односторонне оптимистичен); это потолок робастной avgNetR на данных, край +0.5 недостижим.',
+    },
     params: {
       horizons: HORIZONS.map((h) => `${h.label}(${h.sigTf})`),
       atrMult: ATR_MULT,
       rr: RR,
-      rrDynamic: 'score≥80→3 · ≥85→4 · ≥90→6 (cap: скальп 3, средне 4, долго 6)',
+      rrDynamic: `Phase 1: фиксированный RR_CAP=${RR_CAP} для всех горизонтов, без score-ладдера`,
       scoreMin: SCORE_MIN,
+      adxGate: ADX_GATE,
+      adxGateScalp: ADX_GATE_SCALP,
+      suppressFlatShort: SUPPRESS_FLAT_SHORT,
       costPct: { futures: FEE_RT.futures + SLIP_RT, spot: FEE_RT.spot + SLIP_RT },
       riskBudgetPct: RISK_BUDGET_PCT,
     },
@@ -839,7 +880,14 @@ async function main() {
   process.exit(0)
 }
 
-main().catch((err) => {
-  console.error(err)
-  process.exit(1)
-})
+// Запускаем main() только когда файл — точка входа процесса (node scripts/gen-signals.mjs),
+// а не когда его импортируют ради экспортов (напр. scripts/backtest.mjs). Это единственное
+// условие для инварианта P0-1 «main() — единственное место с fetch/file-IO/process.exit»:
+// сам факт import не должен тянуть за собой сеть/запись файла.
+const isEntryPoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isEntryPoint) {
+  main().catch((err) => {
+    console.error(err)
+    process.exit(1)
+  })
+}

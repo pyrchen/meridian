@@ -40,11 +40,14 @@ interface Signal {
   newsSentiment?: 'pos' | 'neg' | 'neutral' | null
   newsCount?: number
   spark?: number[]
+  // Phase 1 (P1-2/P1-7): momentum/volume/smc/btc/news сняты со скора — score = trend+regime+rs.
+  // Старые закрытые сигналы (до редизайна) могут нести в JSON старые ключи — они просто
+  // игнорируются рендерером (см. inspector()), лишние поля не мешают структурной типизации.
   scoreBreakdown?: {
-    trend: number; momentum: number; regime: number; volume: number; rs: number; smc?: number
-    btc: number; news: number; base: number; total: number
+    trend: number; regime: number; rs: number; base: number; total: number
   }
   cohortWeek?: string
+  engine?: string
   timeframe: string
   createdAt: string
   status: 'open' | 'tp' | 'sl' | 'expired'
@@ -523,6 +526,7 @@ function card(s: Signal, i: number): HTMLElement {
     veryLong: 'Сверхдолго · 1н',
   }
   head.append(el('span', { class: 'hz-badge' }, hzLabels[hz(s)]))
+  if (s.engine) head.append(el('span', { class: 'eng-badge', title: `Движок ${s.engine} — валидирован бэктест-харнессом (avgNetR +0.075)` }, s.engine))
   const str = el('div', { class: 'sig-strength' })
   str.append(el('b', {}, String(s.strength)))
   str.append(el('span', {}, 'сила'))
@@ -726,15 +730,11 @@ function inspector(s: Signal): HTMLElement {
     const section = el('div', { class: 'insp-section' })
     section.append(el('div', { class: 'insp-h' }, 'Разбивка скора'))
 
+    // Phase 1: momentum/volume/smc/btc/news больше не часть скора — строки удалены вместе с ними.
     const rows: [string, number, number, string][] = [
       ['Тренд', bd.trend, 33, ''],
-      ['Моментум', bd.momentum, 27, ''],
       ['ADX / волатильность', bd.regime, 14, bd.regime < 0 ? 'neg' : ''],
-      ['Объём', bd.volume, 8, ''],
       ['Относит. сила', bd.rs, 12, ''],
-      ['Smart Money', bd.smc ?? 0, 10, ''],
-      ['BTC режим', bd.btc, 12, bd.btc < 0 ? 'neg' : bd.btc > 0 ? 'pos' : 'zero'],
-      ['Новости', bd.news, 14, bd.news < 0 ? 'neg' : bd.news > 0 ? 'pos' : 'zero'],
     ]
     for (const [label, val, max, cls] of rows) {
       const row = el('div', { class: 'insp-row' })

@@ -7,6 +7,12 @@ dist-ssr
 # news.json намеренно трекается: cron-коммит = keepalive воркфлоу (иначе
 # public-repo cron авто-отключается через 60 дней) + история + офлайн-фолбэк
 
+# Phase 0 backtest harness (docs/SIGNAL_REDESIGN_PLAN.md): большие кэши/выходы,
+# не трекаем — data/history — свечи-кэш (десятки МБ), data/backtest — сгенерированные
+# сделки/отчёты реплея (переигрываются из истории + gen-signals.mjs по требованию).
+data/history
+data/backtest
+
 # Editor
 .vscode/*
 !.vscode/extensions.json

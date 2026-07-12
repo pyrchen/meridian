@@ -107,6 +107,16 @@ const state = {
   prices: new Map<string, number>(),
   sort: 'strength' as 'strength' | 'created',
   period: 'all' as 'all' | 'day' | 'week' | 'lastweek' | 'month',
+  engine: 'all' as 'all' | 'v2' | 'old',
+}
+
+// Штамп движка (gen-signals.mjs → ENGINE). Сигналы без поля engine — доредизайновые.
+const ENGINE_V2 = 'v2-harness'
+
+function engMatch(s: Signal): boolean {
+  if (state.engine === 'v2') return s.engine === ENGINE_V2
+  if (state.engine === 'old') return !s.engine
+  return true
 }
 
 function hz(s: Signal): 'scalp' | 'mid' | 'long' | 'veryLong' {
@@ -198,6 +208,7 @@ function scoped(): Signal[] {
   }
   list = list.filter((s) => (s.markets || ['futures']).includes(state.mode))
   if (state.horizon !== 'all') list = list.filter((s) => hz(s) === state.horizon)
+  if (state.engine !== 'all') list = list.filter(engMatch)
   if (state.period !== 'all') {
     const now = Date.now()
     const DAY = 86_400_000
@@ -239,12 +250,14 @@ function avg(arr: number[]): number {
   return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
 }
 
+// Стата с учётом активных фильтров (период × движок); byStratum при фильтрах не пересчитываем.
 function computePeriodStats() {
   const d = state.data!
-  if (state.period === 'all') return d.stats
+  if (state.period === 'all' && state.engine === 'all') return d.stats
 
-  const openF = d.open.filter(inPeriod)
-  const closedF = d.closed.filter(inPeriod)
+  const match = (s: Signal) => inPeriod(s) && engMatch(s)
+  const openF = d.open.filter(match)
+  const closedF = d.closed.filter(match)
   const decided = closedF.filter((s) => s.status === 'tp' || s.status === 'sl')
   const wins = decided.filter((s) => s.status === 'tp')
   const losses = decided.filter((s) => s.status === 'sl')
@@ -278,12 +291,14 @@ function computePeriodStats() {
 
 function renderStats() {
   const s = computePeriodStats()
-  const isPeriod = state.period !== 'all'
+  const filters: string[] = []
+  if (state.period !== 'all') filters.push(`период: ${state.period}`)
+  if (state.engine !== 'all') filters.push(`движок: ${state.engine === 'v2' ? ENGINE_V2 : 'старый'}`)
   const netWr = s.netWinRate ?? s.winRate
   const wr = $('s-winrate')
   wr.textContent = `${netWr}%`
-  wr.title = isPeriod
-    ? `период: ${state.period} · брутто ${s.winRate}%`
+  wr.title = filters.length
+    ? `${filters.join(' · ')} · брутто ${s.winRate}%`
     : `брутто ${s.winRate}% · нетто учитывает комиссию + проскальзывание`
   setLabel(wr, 'винрейт нетто')
   $('s-open').textContent = String(s.open)
@@ -443,6 +458,24 @@ function renderControls() {
       renderGrid()
     },
   )
+
+  const nEng = (k: 'v2' | 'old') =>
+    modeList.filter((s) => (k === 'v2' ? s.engine === ENGINE_V2 : !s.engine)).length
+  seg(
+    $('eng'),
+    [
+      { key: 'all', label: 'Все движки' },
+      { key: 'v2', label: 'v2-harness', n: nEng('v2') },
+      { key: 'old', label: 'Старый', n: nEng('old') },
+    ],
+    state.engine,
+    (k) => {
+      state.engine = k as typeof state.engine
+      renderStats()
+      renderControls()
+      renderGrid()
+    },
+  )
 }
 
 function renderGrid() {
@@ -450,7 +483,11 @@ function renderGrid() {
   const items = scoped()
   if (!items.length) {
     grid.replaceChildren()
-    showEmpty('В этой вкладке пока пусто.')
+    showEmpty(
+      state.engine === 'v2'
+        ? 'Сигналов движка v2-harness в этой вкладке пока нет. Он в онлайне с 12.07.2026, гейты жёсткие (ADX ≥ 35/38) — исторический темп ~5–6 сигналов в неделю, паузы до 2–3 недель нормальны.'
+        : 'В этой вкладке пока пусто.',
+    )
     return
   }
   $('empty').hidden = true
@@ -526,7 +563,7 @@ function card(s: Signal, i: number): HTMLElement {
     veryLong: 'Сверхдолго · 1н',
   }
   head.append(el('span', { class: 'hz-badge' }, hzLabels[hz(s)]))
-  if (s.engine) head.append(el('span', { class: 'eng-badge', title: `Движок ${s.engine} — валидирован бэктест-харнессом (avgNetR +0.075)` }, s.engine))
+  if (s.engine) head.append(el('span', { class: 'eng-badge', title: `Движок ${s.engine} — валидирован офлайн-бэктест-харнессом` }, s.engine))
   const str = el('div', { class: 'sig-strength' })
   str.append(el('b', {}, String(s.strength)))
   str.append(el('span', {}, 'сила'))

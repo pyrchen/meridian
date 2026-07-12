@@ -4,9 +4,12 @@
 // adxTilt (≥45→×1.5, ≥38→×1.0, <38→×0.5), кэп 30%/сделку и 45% суммарного открытого
 // риска, levCap 10, salvage: эквити <0.15×старта → риск 2% навсегда.
 //
-// Банкролл ВИРТУАЛЬНЫЙ: старт $1000, ведётся в data/x10/state.json по реализованному
+// Банкролл ВИРТУАЛЬНЫЙ: старт $10 000, ведётся в data/x10/state.json по реализованному
 // PnL позиций (closed-pnl Bybit, комиссии включены). Демо-счёт — только площадка
-// исполнения; его баланс ($165k) в сайзинге не участвует.
+// исполнения; его остальной баланс НЕПРИКОСНОВЕНЕН: сайзинг идёт от виртуального
+// эквити (банкролл + производные по ставкам), а суммарный номинал открытых позиций
+// жёстко ограничен levCap × эквити — больше маржи, чем банкролл способен покрыть
+// при плече 10, бот занять не может.
 //
 // Запуск: node scripts/x10-executor.mjs [--dry]   (планировщик дергает каждые 10 мин)
 // Ключи: .env в корне репо (BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET).
@@ -33,7 +36,7 @@ const RECV = '5000'
 const DRY = process.argv.includes('--dry')
 
 // ── политика X10 v1 (не менять без нового MC-прогона, см. docs/X10_POLICY.md) ──
-const START_EQUITY = 1000
+const START_EQUITY = 10000
 const TARGET_X = 10
 const YEAR_DAYS = 365
 const RISK_BEHIND = 0.15 // ниже лог-прямой к 10x
@@ -243,8 +246,11 @@ async function enter(st, signals) {
     const riskUsd = st.equity * frac
     const stopDist = Math.abs(entry - sl)
     let qty = riskUsd / stopDist
-    // levCap: номинал ≤ 10× виртуального эквити
-    const maxNotional = LEV_CAP * st.equity
+    // Бюджетная изоляция: торгуем только своим банкроллом и его производными.
+    // СУММАРНЫЙ номинал открытых позиций ≤ levCap × виртуального эквити —
+    // остальной баланс демо-счёта бот занять не может.
+    const openNotional = st.open.reduce((a, t) => a + (t.notionalUsd || t.qty * t.entry * t.scale), 0)
+    const maxNotional = Math.max(0, LEV_CAP * st.equity - openNotional)
     if (qty * entry > maxNotional) qty = maxNotional / entry
     const qtyStr = fmtStep(qty, inst.qtyStep)
     if (+qtyStr < inst.minQty) { log(`SKIP ${s.base}: qty ${qtyStr} < min ${inst.minQty}`); continue }
@@ -265,6 +271,7 @@ async function enter(st, signals) {
       signalId: s.id, symbol: s.symbol, bybitSymbol: inst.symbol, scale: inst.scale,
       side: s.side, qty: +qtyStr, entry: s.entry, sl: s.sl, tp: s.tp,
       riskUsd: +riskUsd.toFixed(2), riskFrac: +frac.toFixed(4), adx: s.indicators?.adx ?? null,
+      notionalUsd: +(+qtyStr * entry).toFixed(2),
       openedAt: new Date().toISOString(),
     })
     log(`ENTER ${s.base} ${s.side} qty=${qtyStr} risk=$${riskUsd.toFixed(2)} (${(frac * 100).toFixed(1)}%, ADX ${s.indicators?.adx}) SL ${s.sl} TP ${s.tp}`)

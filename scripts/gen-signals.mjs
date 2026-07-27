@@ -70,6 +70,18 @@ export const ADX_GATE = Number(process.env.ADX_GATE_OVERRIDE) || 35 // Phase 2 (
 export const ADX_GATE_SCALP = Number(process.env.ADX_GATE_SCALP_OVERRIDE) || 38
 export const SUPPRESS_FLAT_SHORT = process.env.SUPPRESS_FLAT_SHORT !== '0' // Phase 2 (P2-4): нет шортов при BTC=flat (flat-shorts avgNetR −0.484)
 
+// Phase 3 (P3-1): потолок ширины стопа для СКАЛЬПА. Скальп живёт MAX_AGE_DAYS.scalp=4 дня,
+// а цель = RR_CAP × riskPct; при riskPct>4.5% это ≥11% хода за ≤4 дня по часовому сигналу —
+// цель практически недостижима, сделка вырождается в «стоп или истечение». На харнессе
+// (top-100, n=5450) этот срез даёт avgNetR −0.124 при n=941 (17% потока) и отрицателен
+// в 4 годах из 5. Плато 4.0–5.0 (avgNetR среза-остатка 0.049/0.032/0.034) — берём середину.
+// Гейт только для скальпа: у mid (12 дней) широкий стоп НЕ отравлен (срез riskPct>4.5 даёт
+// +0.036), у long/veryLong он структурно неизбежен — глобальный потолок просто убил бы
+// эти горизонты, а это не измеренное решение, а побочный эффект.
+export const SCALP_RISK_PCT_MAX = Number(process.env.SCALP_RISK_PCT_MAX_OVERRIDE) || 4.5
+// Аварийный выключатель для абляции в харнессе (SCALP_RISK_PCT_MAX_OVERRIDE=999 тоже работает).
+export const SUPPRESS_SCALP_LONG = process.env.SUPPRESS_SCALP_LONG === '1'
+
 const KEEP_CLOSED = 1500 // держим больше закрытых — нужно для будущей калибровки/валидации
 const SPARK_N = 44
 const TIMEOUT = 12000
@@ -422,6 +434,7 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
   // Phase 2 (P2-4): нет шортов при BTC=flat/chop — на харнессе flat-шорты дали avgNetR −0.484
   // (чистый яд), уборка их — самый большой единичный вклад в положительный pooled avgNetR.
   if (SUPPRESS_FLAT_SHORT && side === 'short' && btc.dir === 'flat') return null
+  if (SUPPRESS_SCALP_LONG && H.key === 'scalp' && side === 'long') return null
   const baseRR = H.rr ?? RR
   const atrMult = H.atrMult ?? ATR_MULT
   let minScore = H.minScore ?? SCORE_MIN
@@ -547,6 +560,8 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
   const riskPct = +((slDist / entry) * 100).toFixed(2)
   const targetPct = +(((rr * slDist) / entry) * 100).toFixed(2)
   if (targetPct < MIN_TARGET_PCT) return null // цель меньше нетто-порога — отбраковываем
+  // P3-1: цель должна быть достижима за срок жизни сигнала (см. SCALP_RISK_PCT_MAX)
+  if (H.key === 'scalp' && riskPct > SCALP_RISK_PCT_MAX) return null
   // доп. цели для частичной фиксации (информативно; статистика по основному tp)
   const tp2 = round(side === 'long' ? entry + (rr + 1.5) * slDist : entry - (rr + 1.5) * slDist)
   const tp3 = null // Phase 1 (P1-1): score≥85 tp3-расширение снято вместе со score→rr ладдером

@@ -701,24 +701,45 @@ export function aggStats(arr) {
   }
 }
 
-export function computeStats(open, closedArr) {
-  const base = aggStats(closedArr)
-  const expired = closedArr.filter((s) => s.status === 'expired').length
-  const winDur = closedArr.filter((s) => s.status === 'tp' && s.durationH != null).map((s) => s.durationH)
-  // разбивка по стратам (горизонт × сторона) с гейтом по объёму выборки
+// разбивка по стратам (горизонт × сторона) с гейтом по объёму выборки
+export function strataOf(closedArr) {
   const strata = {}
   for (const s of closedArr) {
     const key = `${s.horizon || 'mid'}:${s.side}`
     ;(strata[key] ||= []).push(s)
   }
-  const byStratum = Object.entries(strata)
+  return Object.entries(strata)
     .map(([key, arr]) => {
       const [horizon, side] = key.split(':')
       const a = aggStats(arr)
       return { horizon, side, ...a, enough: a.decided >= STRATUM_MIN }
     })
     .sort((x, y) => y.closedTotal - x.closedTotal)
+}
+
+// Сводка по одному движку: закрытая книга + сколько позиций ещё открыто.
+// ВАЖНО: смешивать книги двух движков в одной цифре нельзя — это разные стратегии.
+function engineSlice(open, closedArr) {
+  const a = aggStats(closedArr)
+  return { open: open.length, closedTotal: a.closedTotal, decided: a.decided, wins: a.wins, losses: a.losses, winRate: a.winRate, netWinRate: a.netWinRate, avgR: a.avgR, avgNetR: a.avgNetR, enough: a.decided >= STRATUM_MIN }
+}
+
+export function computeStats(open, closedArr) {
+  const base = aggStats(closedArr)
+  const expired = closedArr.filter((s) => s.status === 'expired').length
+  const winDur = closedArr.filter((s) => s.status === 'tp' && s.durationH != null).map((s) => s.durationH)
+  const byStratum = strataOf(closedArr)
+  // Раздельная книга по движкам. Верхняя цифра avgNetR по ВСЕЙ закрытой книге — это
+  // смесь старого движка и v2, т.е. измерительный артефакт, а не эдж v2: старых сделок
+  // на порядок больше, и они утапливают любой результат нового движка. Потребитель
+  // (UI, отчёты) обязан брать срез своего движка, а не pooled-цифру.
+  const isV2 = (s) => s.engine === ENGINE
+  const byEngine = {
+    [ENGINE]: engineSlice(open.filter(isV2), closedArr.filter(isV2)),
+    legacy: engineSlice(open.filter((s) => !isV2(s)), closedArr.filter((s) => !isV2(s))),
+  }
   return {
+    byEngine,
     open: open.length,
     closedTotal: base.closedTotal,
     wins: base.wins,

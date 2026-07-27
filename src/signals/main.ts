@@ -107,7 +107,10 @@ const state = {
   prices: new Map<string, number>(),
   sort: 'strength' as 'strength' | 'created',
   period: 'all' as 'all' | 'day' | 'week' | 'lastweek' | 'month',
-  engine: 'all' as 'all' | 'v2' | 'old',
+  // По умолчанию — ТОЛЬКО текущий движок. Pooled-цифра по всем движкам смешивает книгу
+  // v2 с на порядок большей книгой доредизайнового движка и потому измеряет не эдж v2,
+  // а долю старых сделок в выборке. Смесь доступна явным переключением на «Все движки».
+  engine: 'v2' as 'all' | 'v2' | 'old',
 }
 
 // Штамп движка (gen-signals.mjs → ENGINE). Сигналы без поля engine — доредизайновые.
@@ -250,7 +253,9 @@ function avg(arr: number[]): number {
   return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
 }
 
-// Стата с учётом активных фильтров (период × движок); byStratum при фильтрах не пересчитываем.
+// Стата с учётом активных фильтров (период × движок). byStratum тоже пересчитывается:
+// раньше при активном фильтре он падал обратно на общий d.stats.byStratum, и таблица страт
+// показывала книгу ВСЕХ движков под заголовком отфильтрованной статы.
 function computePeriodStats() {
   const d = state.data!
   if (state.period === 'all' && state.engine === 'all') return d.stats
@@ -285,8 +290,40 @@ function computePeriodStats() {
     avgWinDurationH,
     avgEtaOpenH,
     sampleGate: d.stats.sampleGate,
-    byStratum: undefined as typeof d.stats.byStratum,
+    byStratum: strataOf(closedF, d.stats.sampleGate ?? 50),
   }
+}
+
+// Пересчёт таблицы страт (горизонт × сторона) на отфильтрованной книге.
+function strataOf(closedF: Signal[], gate: number): Stratum[] {
+  const groups = new Map<string, Signal[]>()
+  for (const s of closedF) {
+    const key = `${hz(s)}:${s.side}`
+    const g = groups.get(key)
+    if (g) g.push(s)
+    else groups.set(key, [s])
+  }
+  const round1 = (v: number) => Math.round(v * 10) / 10
+  const round2 = (v: number) => Math.round(v * 100) / 100
+  const out: Stratum[] = []
+  for (const [key, arr] of groups) {
+    const [horizon, side] = key.split(':')
+    const dec = arr.filter((s) => s.status === 'tp' || s.status === 'sl')
+    const wins = dec.filter((s) => s.status === 'tp').length
+    const netWins = dec.filter((s) => (s.netR ?? s.r ?? 0) > 0).length
+    out.push({
+      horizon, side,
+      closedTotal: arr.length,
+      decided: dec.length,
+      winRate: dec.length ? round1((wins / dec.length) * 100) : 0,
+      netWinRate: dec.length ? round1((netWins / dec.length) * 100) : 0,
+      avgR: round2(avg(dec.map((s) => s.r ?? 0))),
+      avgNetR: round2(avg(dec.map((s) => s.netR ?? s.r ?? 0))),
+      totalNetPnlPct: round1(dec.reduce((a, s) => a + (s.netPnlPct ?? 0), 0)),
+      enough: dec.length >= gate,
+    })
+  }
+  return out.sort((x, y) => y.closedTotal - x.closedTotal)
 }
 
 function renderStats() {
@@ -305,9 +342,12 @@ function renderStats() {
   $('s-eta').textContent = s.avgWinDurationH ? fmtDur(s.avgWinDurationH) : '≈' + fmtDur(s.avgEtaOpenH)
   const netR = s.avgNetR ?? s.avgR
   const ar = $('s-avgr')
+  const nDecided = s.wins + s.losses
   ar.textContent = (netR >= 0 ? '+' : '') + netR + 'R'
-  ar.title = `брутто ${s.avgR}R`
-  setLabel(ar, 'средний R нетто')
+  // Размер выборки — часть цифры, а не сноска: на книге в пару сотен сделок разброс
+  // среднего R больше самого среднего, и знак ничего не решает.
+  ar.title = `брутто ${s.avgR}R · выборка ${nDecided} решённых сделок${nDecided < (s.sampleGate ?? 50) ? ' — ниже порога выборки, знак не значим' : ''}`
+  setLabel(ar, `средний R нетто · n=${nDecided}`)
   $('s-closed').textContent = `${s.wins} / ${s.losses}`
   $('s-universe').textContent = String(state.data!.universeSize)
   renderStrata(s.byStratum)
@@ -323,7 +363,8 @@ function renderStrata(byStratum?: Stratum[]) {
   const host = document.getElementById('strata')
   if (!host) return
   const s = state.data!.stats
-  const rows = (byStratum ?? s.byStratum ?? []).filter((r) => r.closedTotal > 0)
+  // НЕ падаем обратно на s.byStratum: это книга всех движков, под фильтром она врёт.
+  const rows = (byStratum ?? []).filter((r) => r.closedTotal > 0)
   if (!rows.length) {
     host.replaceChildren()
     return

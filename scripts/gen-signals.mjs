@@ -60,8 +60,12 @@ export const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // с
 // оценка плюсовая, ноль не исключён (survivorship-bias односторонне оптимистичен). Это ЧЕСТНОЕ
 // ПЛАТО: pooled avgNetR держит скальп (76% потока, край +0.012); край +0.5 недостижим — требовал
 // бы WR ~43% при rr2.5 против факт. ~32%, такого края в индикаторах нет. См. docs/SIGNAL_REDESIGN_PLAN.md.
-export const ENGINE = 'v2-harness'
-export const ENGINE_ONLINE_AT = '2026-07-12' // дата вывода харнесс-валидированного движка в онлайн
+export const ENGINE = 'v3-focus'
+export const ENGINE_ONLINE_AT = '2026-07-27' // дата вывода сфокусированного движка (P5-1) в онлайн
+// Предыдущий штамп. Новый штамп обязателен: P5-1 меняет состав потока, а не параметр внутри
+// него, поэтому смешивать закрытые сделки v2 и v3 в одной avgNetR нельзя — это была бы та же
+// ошибка измерения, что и смесь «старый + v2» (см. commit 3dacf40).
+export const ENGINE_PREV = 'v2-harness'
 
 export const ADX_GATE = Number(process.env.ADX_GATE_OVERRIDE) || 35 // Phase 2 (P2-2): entry ADX floor (mid/long/veryLong); harness plateau 34–38, было 18
 // Скальп (1ч) шумнее — планка ADX выше. Харнесс-свип-2: scalp≥38 поднял pooled avgNetR
@@ -79,8 +83,17 @@ export const SUPPRESS_FLAT_SHORT = process.env.SUPPRESS_FLAT_SHORT !== '0' // Ph
 // +0.036), у long/veryLong он структурно неизбежен — глобальный потолок просто убил бы
 // эти горизонты, а это не измеренное решение, а побочный эффект.
 export const SCALP_RISK_PCT_MAX = Number(process.env.SCALP_RISK_PCT_MAX_OVERRIDE) || 4.5
-// Аварийный выключатель для абляции в харнессе (SCALP_RISK_PCT_MAX_OVERRIDE=999 тоже работает).
-export const SUPPRESS_SCALP_LONG = process.env.SUPPRESS_SCALP_LONG === '1'
+// Phase 5 (P5-1): движок сведён к двум измеренным потокам — СКАЛЬП-ШОРТ и MID (обе стороны).
+// Основание — полный реплей top-100 за 2021-08…2026-07 текущим движком (n=4616 решённых,
+// lookahead-аудит PASS, сводка в data/backtest/slices-v3.json):
+//   scalp:short  avgNetR +0.097 (n=2093)   mid:long +0.071 (n=473)   mid:short +0.092 (n=621)
+//   scalp:long   avgNetR −0.091 (n=1340)   long:long −0.082 (n=86)   veryLong n=3 — не измеряемо
+// Оставленный срез: avgNetR +0.093 (n=3187) против +0.036 у полной книги; выброшенный срез
+// даёт −0.090 (n=1429). Живая книга 15 дней подтверждает знак независимо: скальп −$84, mid +$114
+// при $100 в сделку. Оба переключателя env-override — харнесс может вернуть срез для абляции.
+export const SUPPRESS_SCALP_LONG = process.env.SUPPRESS_SCALP_LONG !== '0'
+export const ENABLED_HORIZONS = (process.env.ENABLED_HORIZONS_OVERRIDE || 'scalp,mid')
+  .split(',').map((s) => s.trim()).filter(Boolean)
 
 const KEEP_CLOSED = 1500 // держим больше закрытых — нужно для будущей калибровки/валидации
 const SPARK_N = 44
@@ -127,6 +140,12 @@ export const HORIZONS = [
     trendAggregate: 4, trendOpts: { fast: 6, slow: 12, min: 18 },
   },
 ]
+// Горизонты, включённые в текущей политике (P4-1). Сам массив HORIZONS не режем: описание
+// long/veryLong остаётся в коде, чтобы харнесс мог вернуть их одним ENABLED_HORIZONS_OVERRIDE
+// и переизмерить, а не восстанавливать удалённую конфигурацию по памяти.
+export const ACTIVE_HORIZONS = HORIZONS.filter((h) => ENABLED_HORIZONS.includes(h.key))
+// Таймфреймы, которые реально нужны включённым горизонтам (сигнальный + трендовый).
+export const ACTIVE_TFS = [...new Set(ACTIVE_HORIZONS.flatMap((h) => [h.sigTf, h.trendTf]))]
 export const KLINE_LIMITS = { '1h': 330, '4h': 330, '1d': 320, '1w': 260 }
 
 const STABLES = new Set([
@@ -399,6 +418,9 @@ export function calibrateFromClosed(closedArr) {
 }
 
 export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now, rsRank, calib) {
+  // P5-1: единственная точка отсечения выключенных горизонтов — здесь, а не в вызывающем цикле,
+  // чтобы онлайн и офлайн-харнесс отсекали их одинаково (харнесс вызывает эту функцию напрямую).
+  if (!ENABLED_HORIZONS.includes(H.key)) return null
   // тренд старшего ТФ (для veryLong агрегируем недели в «месяцы» — реальное 4× разделение)
   let tc = closed(trendCandles, now)
   if (H.trendAggregate) tc = aggregate(tc, H.trendAggregate)
@@ -434,6 +456,8 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
   // Phase 2 (P2-4): нет шортов при BTC=flat/chop — на харнессе flat-шорты дали avgNetR −0.484
   // (чистый яд), уборка их — самый большой единичный вклад в положительный pooled avgNetR.
   if (SUPPRESS_FLAT_SHORT && side === 'short' && btc.dir === 'flat') return null
+  // Phase 5 (P5-1): скальп-лонг убит — единственный систематически убыточный срез потока
+  // (avgNetR −0.091 при n=1340 на пятилетнем реплее top-100, см. data/backtest/slices-v3.json).
   if (SUPPRESS_SCALP_LONG && H.key === 'scalp' && side === 'long') return null
   const baseRR = H.rr ?? RR
   const atrMult = H.atrMult ?? ATR_MULT
@@ -828,19 +852,15 @@ async function main() {
   const [universe, btc, newsHitFn] = await Promise.all([buildUniverse(), btcRegime(now), loadNewsIndex(now)])
   console.log(`Универсум: ${universe.length}; BTC: ${btc.dir} (${btc.change7d}% за 7д)`)
 
-  // тянем 1h/4h/1d по всем монетам
+  // тянем только те ТФ, что нужны включённым горизонтам (P5-1: scalp+mid → 1h/4h/1d).
+  // Свечи для ещё открытых сигналов выключенного горизонта догружаются точечно ниже.
   const data = await mapLimit(universe, 8, async (u) => {
-    const [h1, h4, d1, w1] = await Promise.all([
-      klines(u.symbol, '1h', KLINE_LIMITS['1h']),
-      klines(u.symbol, '4h', KLINE_LIMITS['4h']),
-      klines(u.symbol, '1d', KLINE_LIMITS['1d']),
-      klines(u.symbol, '1w', KLINE_LIMITS['1w']),
-    ])
-    return { ...u, tf: { '1h': h1, '4h': h4, '1d': d1, '1w': w1 } }
+    const arrs = await Promise.all(ACTIVE_TFS.map((tf) => klines(u.symbol, tf, KLINE_LIMITS[tf])))
+    return { ...u, tf: Object.fromEntries(ACTIVE_TFS.map((tf, i) => [tf, arrs[i]])) }
   })
   const fetched = data.filter(Boolean)
-  const tfMap = { '1h': new Map(), '4h': new Map(), '1d': new Map(), '1w': new Map() }
-  for (const x of fetched) for (const k of Object.keys(tfMap)) tfMap[k].set(x.symbol, x.tf[k])
+  const tfMap = Object.fromEntries(ACTIVE_TFS.map((tf) => [tf, new Map()]))
+  for (const x of fetched) for (const k of ACTIVE_TFS) tfMap[k].set(x.symbol, x.tf[k])
   const rsRanks = buildRsRanks(fetched, now) // относительная сила по горизонтам
   console.log(`Свечи получены: ${fetched.length}`)
 
@@ -874,7 +894,7 @@ async function main() {
   let added = 0
   for (const x of fetched) {
     const newsHit = newsHitFn(x.base)
-    for (const H of HORIZONS) {
+    for (const H of ACTIVE_HORIZONS) {
       const rs = rsRanks[H.key] ? rsRanks[H.key].get(x.symbol) : null
       const sig = analyzeHorizon(x, H, x.tf[H.sigTf], x.tf[H.trendTf], btc, newsHit, now, rs ?? null, calib)
       if (!sig) continue
@@ -905,11 +925,17 @@ async function main() {
       online: true,
       onlineAt: ENGINE_ONLINE_AT,
       basis: 'harness',
-      gates: { adxGate: ADX_GATE, adxGateScalp: ADX_GATE_SCALP, suppressFlatShort: SUPPRESS_FLAT_SHORT, rrCap: RR_CAP },
+      prev: ENGINE_PREV,
+      gates: {
+        adxGate: ADX_GATE, adxGateScalp: ADX_GATE_SCALP, suppressFlatShort: SUPPRESS_FLAT_SHORT, rrCap: RR_CAP,
+        enabledHorizons: ENABLED_HORIZONS, suppressScalpLong: SUPPRESS_SCALP_LONG, scalpRiskPctMax: SCALP_RISK_PCT_MAX,
+      },
+      flow: 'Phase 5 (P5-1): поток сведён к скальп-шортам и mid обеих сторон. Пятилетний реплей top-100 (n=4616 решённых, аудит на заглядывание вперёд PASS): оставленный срез avgNetR +0.093 (n=3187) против +0.036 у полной книги; выброшенное — scalp:long −0.091 (n=1340), long −0.082 (n=86), veryLong n=3 (не измеряемо). Сводка: data/backtest/slices-v3.json. Штамп движка сменён с v2-harness на v3-focus: состав потока изменился, поэтому книги меряются раздельно. Ожидаемый темп — примерно вдвое реже сигналов, чем у v2.',
       note: 'Новый движок в онлайне, валидирован офлайн-бэктест-харнессом (~3г истории, lookahead-аудит PASS). Phase 1: убит score→rr ладдер, скор сжат до trend+regime+rs. Phase 2: ADX-гейт 18→35 (скальп→38, шумный 1ч), нет шортов при BTC=flat, long:short убит. Подтверждённая реплеем абляция pooled avgNetR: −0.09 (старый) → −0.05 (Phase 1) → +0.046 (v2, close/next-open совпали), WR 32%, оба значимых режима BTC +0.054. Край mid +0.14 / long +0.30, скальп +0.01 (76% потока — держит pooled). Честная оговорка: 90% CI [−0.05,+0.15] — точечная оценка плюсовая, ноль статистически не исключён (survivorship-bias односторонне оптимистичен); это потолок робастной avgNetR на данных, край +0.5 недостижим.',
     },
     params: {
-      horizons: HORIZONS.map((h) => `${h.label}(${h.sigTf})`),
+      horizons: ACTIVE_HORIZONS.map((h) => `${h.label}(${h.sigTf})`),
+      sides: ACTIVE_HORIZONS.map((h) => `${h.key}: ${h.key === 'scalp' && SUPPRESS_SCALP_LONG ? 'только шорт' : 'лонг+шорт'}`),
       atrMult: ATR_MULT,
       rr: RR,
       rrDynamic: `Phase 1: фиксированный RR_CAP=${RR_CAP} для всех горизонтов, без score-ладдера`,

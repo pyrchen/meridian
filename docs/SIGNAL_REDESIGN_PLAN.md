@@ -189,6 +189,32 @@ After P1-2 the score is `fTrend + fReg + fRs`. Keep it **coarse and rounded**: A
 
 ---
 
+### PHASE 5 — Flow focus (SHIPPED 2026-07-27, engine stamp `v3-focus`)
+
+**P5-1 · Cut the flow to `scalp:short` + `mid` (both sides).** **[V]** — measured, not reasoned.
+Full replay of the then-current engine over the production universe (top-100 snapshot, 101 symbols, 2021-08→2026-07, n=4616 decided, lookahead audit PASS; summary kept in `data/backtest/slices-v3.json`):
+
+| stratum | n | avgNetR | verdict |
+|---|---|---|---|
+| `scalp:short` | 2093 | **+0.097** | keep |
+| `mid:short` | 621 | **+0.092** | keep |
+| `mid:long` | 473 | **+0.071** | keep |
+| `scalp:long` | 1340 | **−0.091** | kill — the only systematically negative slice |
+| `long:long` | 86 | −0.082 | kill — thin and negative |
+| `veryLong` | 3 | — | kill — not measurable |
+
+Kept slice pools to **avgNetR +0.093 (n=3187)** vs **+0.036** for the whole book; the dropped slice pools to −0.090 (n=1429). Per-year on the kept slice: 2021 −73 · 2022 +200 · 2023 +50 · 2024 +714 · 2025 −50 · 2026 +452 (sum of net pnl%, i.e. $ at $100/trade, 1x). The 15-day live book agrees on sign independently: scalp −$84, mid +$114.
+
+Implementation: `ENABLED_HORIZONS` (default `scalp,mid`) + `SUPPRESS_SCALP_LONG` (now default ON), both env-overridable (`ENABLED_HORIZONS_OVERRIDE`, `SUPPRESS_SCALP_LONG=0`) so the harness can re-enable any slice for ablation. The cut-off lives in **one place** — the top of `analyzeHorizon` — so online and harness agree by construction; `HORIZONS` still describes all four horizons rather than deleting the disabled configuration. Only the timeframes the active horizons need are fetched (`ACTIVE_TFS` → 1h/4h/1d; 1w dropped), with per-signal on-demand fetch still covering legacy open positions.
+
+**Engine stamp bumped `v2-harness` → `v3-focus`.** Mandatory: this changes the *composition* of the flow, not a parameter inside it, so pooling closed trades from both would repeat the measurement error fixed in commit 3dacf40. The UI splits the book three ways (v3 / v2 / old).
+
+Expected cost: roughly **half the signal rate** — `scalp:long` alone was 29% of decided flow, and `long`/`veryLong` added a trickle. Guardrail 5 (floor-check) is satisfied deliberately, not accidentally: both surviving strata clear `STRATUM_MIN` by a wide margin.
+
+Caveat that does not go away: the replay universe is today's top-100 snapshot, so it is survivorship-biased and one-sidedly optimistic. It can falsify a losing rule — that is exactly what it did to `scalp:long` — but it cannot prove the survivors profitable.
+
+---
+
 ## 4. What to KILL / what to KEEP
 
 **KILL (remove entirely):**

@@ -107,18 +107,24 @@ const state = {
   prices: new Map<string, number>(),
   sort: 'strength' as 'strength' | 'created',
   period: 'all' as 'all' | 'day' | 'week' | 'lastweek' | 'month',
-  // По умолчанию — ТОЛЬКО текущий движок. Pooled-цифра по всем движкам смешивает книгу
-  // v2 с на порядок большей книгой доредизайнового движка и потому измеряет не эдж v2,
-  // а долю старых сделок в выборке. Смесь доступна явным переключением на «Все движки».
-  engine: 'v2' as 'all' | 'v2' | 'old',
+  // По умолчанию — ТОЛЬКО текущий движок. Pooled-цифра по всем движкам смешивает книги
+  // разных стратегий и потому измеряет не эдж текущего движка, а долю старых сделок
+  // в выборке. Смесь доступна явным переключением на «Все движки».
+  engine: 'v3' as 'all' | 'v3' | 'v2',
 }
 
-// Штамп движка (gen-signals.mjs → ENGINE). Сигналы без поля engine — доредизайновые.
+// Штампы движков (gen-signals.mjs → ENGINE). Сигналы без поля engine — доредизайновые,
+// в интерфейс они не попадают вовсе (см. load()). v3-focus отличается от v2-harness
+// составом потока (только скальп-шорт и mid), поэтому это отдельная книга, а не
+// продолжение предыдущей.
+const ENGINE_V3 = 'v3-focus'
 const ENGINE_V2 = 'v2-harness'
 
+const isModern = (s: Signal): boolean => s.engine === ENGINE_V3 || s.engine === ENGINE_V2
+
 function engMatch(s: Signal): boolean {
+  if (state.engine === 'v3') return s.engine === ENGINE_V3
   if (state.engine === 'v2') return s.engine === ENGINE_V2
-  if (state.engine === 'old') return !s.engine
   return true
 }
 
@@ -188,7 +194,12 @@ async function load() {
   try {
     const res = await fetch(`${BASE}data/signals.json?v=${Date.now()}`, { cache: 'no-cache' })
     if (!res.ok) throw new Error(String(res.status))
-    state.data = (await res.json()) as SignalsData
+    const raw = (await res.json()) as SignalsData
+    // Книга доредизайнового движка (сигналы без штампа `engine`) в интерфейс не попадает:
+    // это другая стратегия, её сделки смешивали бы измерение текущей. В signals.json они
+    // остаются — данные не удаляются, только не отображаются. Отсечка здесь, одной точкой,
+    // чтобы ни один срез ниже (карточки, стата, страты, счётчики вкладок) их не увидел.
+    state.data = { ...raw, open: raw.open.filter(isModern), closed: raw.closed.filter(isModern) }
     renderAll()
     fetchPrices()
   } catch {
@@ -258,7 +269,9 @@ function avg(arr: number[]): number {
 // показывала книгу ВСЕХ движков под заголовком отфильтрованной статы.
 function computePeriodStats() {
   const d = state.data!
-  if (state.period === 'all' && state.engine === 'all') return d.stats
+  // Раньше при «всё × все движки» здесь возвращалась готовая stats из signals.json. Теперь
+  // нельзя: она посчитана по ПОЛНОЙ книге, включая скрытые доредизайновые сделки, и показала
+  // бы цифру не той выборки, что на экране. Считаем всегда по видимому списку.
 
   const match = (s: Signal) => inPeriod(s) && engMatch(s)
   const openF = d.open.filter(match)
@@ -330,7 +343,9 @@ function renderStats() {
   const s = computePeriodStats()
   const filters: string[] = []
   if (state.period !== 'all') filters.push(`период: ${state.period}`)
-  if (state.engine !== 'all') filters.push(`движок: ${state.engine === 'v2' ? ENGINE_V2 : 'старый'}`)
+  if (state.engine !== 'all') {
+    filters.push(`движок: ${state.engine === 'v3' ? ENGINE_V3 : state.engine === 'v2' ? ENGINE_V2 : 'старый'}`)
+  }
   const netWr = s.netWinRate ?? s.winRate
   const wr = $('s-winrate')
   wr.textContent = `${netWr}%`
@@ -500,14 +515,14 @@ function renderControls() {
     },
   )
 
-  const nEng = (k: 'v2' | 'old') =>
-    modeList.filter((s) => (k === 'v2' ? s.engine === ENGINE_V2 : !s.engine)).length
+  const nEng = (k: 'v3' | 'v2') =>
+    modeList.filter((s) => s.engine === (k === 'v3' ? ENGINE_V3 : ENGINE_V2)).length
   seg(
     $('eng'),
     [
       { key: 'all', label: 'Все движки' },
+      { key: 'v3', label: 'v3-focus', n: nEng('v3') },
       { key: 'v2', label: 'v2-harness', n: nEng('v2') },
-      { key: 'old', label: 'Старый', n: nEng('old') },
     ],
     state.engine,
     (k) => {
@@ -525,9 +540,11 @@ function renderGrid() {
   if (!items.length) {
     grid.replaceChildren()
     showEmpty(
-      state.engine === 'v2'
-        ? 'Сигналов движка v2-harness в этой вкладке пока нет. Он в онлайне с 12.07.2026, гейты жёсткие (ADX ≥ 35/38) — исторический темп ~5–6 сигналов в неделю, паузы до 2–3 недель нормальны.'
-        : 'В этой вкладке пока пусто.',
+      state.engine === 'v3'
+        ? 'Сигналов движка v3-focus в этой вкладке пока нет. Он в онлайне с 27.07.2026 и берёт только скальп-шорты и mid обеих сторон — при жёстких гейтах (ADX ≥ 35/38) это примерно вдвое реже прежнего, паузы в несколько недель нормальны.'
+        : state.engine === 'v2'
+          ? 'Сигналов движка v2-harness в этой вкладке нет. Он работал с 12.07 по 27.07.2026 и заменён на v3-focus.'
+          : 'В этой вкладке пока пусто.',
     )
     return
   }

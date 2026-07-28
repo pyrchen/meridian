@@ -1,22 +1,16 @@
 <!doctype html>
-<html lang="ru" data-theme="dark">
+<html lang="ru" data-theme="dark" data-app="signals">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Meridian · Сигналы</title>
     <meta name="robots" content="noindex, nofollow" />
-    <meta name="theme-color" content="#090d18" />
+    <meta name="theme-color" content="#0a0a0b" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Newsreader:wght@500;600&family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
     <script>
       try {
-        const t = localStorage.getItem('meridian-theme');
-        if (t) document.documentElement.dataset.theme = t;
+        const t = localStorage.getItem('meridian-theme')
+        if (t) document.documentElement.dataset.theme = t
       } catch (e) {}
     </script>
   </head>
@@ -24,9 +18,9 @@
     <div class="gate" id="gate">
       <div class="gate__card">
         <svg class="gate__mark" viewBox="0 0 64 64" aria-hidden="true">
-          <circle cx="32" cy="34" r="18" fill="none" stroke="#2a3450" stroke-width="2.4" />
-          <line x1="32" y1="8" x2="32" y2="58" stroke="#ffb14e" stroke-width="2.4" />
-          <circle cx="32" cy="15" r="4.2" fill="#ffb14e" />
+          <circle cx="32" cy="34" r="18" fill="none" stroke="currentColor" stroke-width="2.4" opacity=".35" />
+          <line x1="32" y1="8" x2="32" y2="58" stroke="currentColor" stroke-width="2.4" />
+          <circle cx="32" cy="15" r="4.2" fill="currentColor" />
         </svg>
         <h1>Сигналы</h1>
         <p>Приватный анализатор альткойнов. Введи код доступа.</p>
@@ -44,66 +38,63 @@
       </div>
     </div>
 
-    <main class="term" id="app" hidden>
-      <header class="term__bar">
-        <div class="wrap term__bar-row">
-          <div class="term__title">
-            MERI<span class="brand__tick"></span>DIAN · Сигналы
-          </div>
-          <span class="live" id="live">
-            <span class="live__dot"></span><span id="live-text">загрузка…</span>
-          </span>
-          <nav class="term__nav">
-            <a href="./">← Новости</a>
-            <a href="./arbitrage.html">Терминал</a>
-            <button class="sig-theme-btn" id="sig-theme-btn" aria-label="Сменить тему"></button>
-          </nav>
-        </div>
+    <main class="sig" id="app" hidden>
+      <!-- строка 1: идентификация, статус-вкладки, сводка книги -->
+      <header class="sig__top">
+        <a class="sig__mark" href="./" title="К ленте">MERI<i></i>DIAN</a>
+        <span class="sig__hr"></span>
+        <div class="segs" id="status" role="tablist" aria-label="Статус сделок"></div>
+        <div class="sig__spacer"></div>
+        <span class="sig__book" id="book-line"></span>
+        <span class="sig__hr"></span>
+        <span class="live" id="live"><i></i><span id="live-text">загрузка…</span></span>
+        <a class="btn-ghost" href="./arbitrage.html">Арбитраж</a>
+        <button class="btn-ghost" id="theme-btn" aria-label="Сменить тему">☀</button>
       </header>
 
-      <div class="wrap">
-        <div class="stats">
-          <div class="stat good"><b id="s-winrate">—</b><span>винрейт (TP/SL)</span></div>
-          <div class="stat"><b id="s-open">—</b><span>открытых сигналов</span></div>
-          <div class="stat"><b id="s-eta">—</b><span>срок до тейка</span></div>
-          <div class="stat"><b id="s-avgr">—</b><span>средний R</span></div>
-          <div class="stat"><b id="s-closed">—</b><span>закрыто (W/L)</span></div>
-          <div class="stat"><b id="s-universe">—</b><span>монет в сканере</span></div>
-        </div>
+      <!-- строка 2: срезы -->
+      <div class="sig__filters">
+        <div class="fgroup" id="f-horizon"></div>
+        <div class="fgroup" id="f-side"></div>
+        <div class="fgroup" id="f-period"></div>
+        <div class="fgroup" id="f-engine"></div>
+        <div class="sig__spacer"></div>
+        <span class="slice" id="slice"></span>
+      </div>
 
-        <details class="strata-wrap">
-          <summary>Статистика по стратам (горизонт × сторона, нетто)</summary>
-          <div class="strata" id="strata"></div>
-        </details>
+      <div class="sig__cols">
+        <!-- слева: поток -->
+        <aside class="col col--list">
+          <div class="col__head">
+            <span id="list-title">Открытые сигналы</span>
+            <span id="list-count"></span>
+          </div>
+          <div class="list" id="list" tabindex="-1"></div>
+        </aside>
 
-        <div class="filters2">
-          <div class="seg" id="tabs"></div>
-          <div class="seg" id="hz"></div>
-          <div class="seg" id="sides"></div>
-        </div>
-        <div class="filters2-sub">
-          <div class="seg" id="period"></div>
-          <div class="seg" id="eng"></div>
-          <div class="seg" id="sort"></div>
-        </div>
+        <!-- центр: цена выбранной сделки + аналитика -->
+        <section class="col col--main">
+          <div class="px__head" id="px-head"></div>
+          <div class="px" id="px"></div>
+          <div class="tabs">
+            <div class="tabs__scroll" id="panel-tabs" role="tablist" aria-label="Аналитика книги"></div>
+            <div class="tabs__tools">
+              <span class="dd" id="dd"></span>
+              <div class="unit" id="unit"></div>
+            </div>
+          </div>
+          <div class="panel" id="panel"></div>
+        </section>
 
-        <div class="sig-grid" id="grid"></div>
-        <div class="term__empty" id="empty" hidden></div>
-
-        <div class="disclaimer">
-          <b>Не финансовый совет, не гарантия прибыли.</b> Сигналы — технический
-          анализ на трёх горизонтах (скальп 1ч, средне 4ч, долго 1д) с фильтром
-          тренда старшего ТФ: EMA50/200, RSI, MACD, ATR, ADX, объём. Дополнительно
-          учитываются режим BTC (нисходящий BTC давит лонги альтов) и свежий
-          новостной фон по монете (упоминания в ленте + грубый тон — он может
-          снизить или повысить силу сигнала). <b>Фьючерсы</b> — лонг и шорт, все
-          горизонты, с графиком и уровнями. <b>Спот</b> — только покупки на
-          средне/долгом горизонте (актив под хранение). Срок до цели —
-          прогноз-ориентир, не обещание. Вход/стоп/тейк — от цены на момент
-          сигнала; исполнение зависит от проскальзывания, комиссий, ликвидности.
-          Исход (TP/SL) считается по свечам, при двойном касании берётся стоп.
-          Риском, размером позиции и плечом управляешь сам.
-        </div>
+        <!-- справа: карточка выбранного -->
+        <aside class="col col--detail">
+          <div class="detail" id="detail"></div>
+          <p class="fineprint">
+            Прибыль везде нетто — после комиссии и проскальзывания; брутто только рядом
+            с нетто. Средние даны с размером выборки и 95%-интервалом; срезы ниже
+            порога выборки помечены как неизмеримые. Не финансовый совет.
+          </p>
+        </aside>
       </div>
     </main>
 

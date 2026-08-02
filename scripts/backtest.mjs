@@ -22,6 +22,9 @@ import {
   calibrateFromClosed, aggStats, computeStats, btcRegimeFrom,
   HORIZONS, MAX_AGE_DAYS, STRATUM_MIN, KLINE_LIMITS,
 } from './gen-signals.mjs'
+// SMC-слой (--smc=refine, см. docs/SMC_ENGINE_SPEC.md §5.1). Импорт сам по себе не влияет
+// на default-путь --replay без --smc — вызывается только из runReplaySmc() ниже.
+import { smcRefine, SMC_SWING_N, SMC_BREAK_MODE, SMC_DEFER_EXPIRY_BARS, SMC_GATES } from './smc.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
@@ -41,6 +44,9 @@ const SYMBOLS_META = resolve(HIST_DIR, `_symbols${TAG}.json`)
 const TRADES_PATH = resolve(BT_DIR, `trades${TAG}.json`)
 const AUDIT_PATH = resolve(BT_DIR, `audit${TAG}.json`)
 const REPORT_PATH = resolve(BT_DIR, `report${TAG}.json`)
+// scripts/smc-report.mjs читает ровно этот путь (`smc-${rawTag}.json`) — TAG уже несёт
+// свой дефис (`-${tag}`), поэтому здесь БЕЗ дополнительного дефиса.
+const SMC_TRADES_PATH = resolve(BT_DIR, `smc${TAG}.json`)
 
 const BINANCE = 'https://data-api.binance.vision'
 const PULL_INTERVALS = ['1h', '4h', '1d', '1w']
@@ -484,6 +490,331 @@ async function runReplay() {
   console.log(`\nВсего закрытых сделок в реплее: ${allTrades.length}. Записано в ${TRADES_PATH}`)
 }
 
+// ── SMC-реплей (--smc=refine, SMC_ENGINE_SPEC.md §5.1/§4) ──
+//
+// НЕ переиспользует replayHorizon()/runReplay() тела напрямую — это сознательное решение,
+// не лень: любой рефакторинг общего цикла ради переиспользования рискует незаметно
+// изменить порядок операций в БАЗОВОМ пути и нарушить критерий приёмки №1 (бит-в-бит
+// --replay без --smc). Дублирование T-axis/candidate-цикла здесь дороже в строках, но
+// безопаснее для инварианта. Общие ЧИСТЫЕ хелперы (windowEndingAt, findIdxAtOrBefore,
+// makeProgress, btcRegimeFrom, buildRsRanks, analyzeHorizon, evaluateSignal) — те же самые.
+
+function auditCountersSmc() {
+  return { ...auditCounters(), smcWindowChecks: 0, smcWindowViolations: 0 }
+}
+
+// §4: сканируем idx+1..idx+expiryBars. Инвалидация проверяется РАНЬШЕ заполнения внутри
+// каждого бара (внутрисвечной порядок неизвестен — берём худший для нас вариант). Цена
+// заполнения — ровно уровень лимитника, не close/extreme бара.
+function scanPendingFill(side, pending, sigArr, startIdx, evalNow) {
+  const { limit, invalidate, expiryBars } = pending
+  for (let k = 1; k <= expiryBars; k++) {
+    const i = startIdx + k
+    if (i >= sigArr.length) return { filled: false, reason: 'cancelled_expired' }
+    const bar = sigArr[i]
+    if (bar.ct > evalNow) return { filled: false, reason: 'cancelled_expired' }
+    if (side === 'long') {
+      if (bar.l <= invalidate) return { filled: false, reason: 'cancelled_invalidated' }
+      if (bar.l <= limit) return { filled: true, ct: bar.ct }
+    } else {
+      if (bar.h >= invalidate) return { filled: false, reason: 'cancelled_invalidated' }
+      if (bar.h >= limit) return { filled: true, ct: bar.ct }
+    }
+  }
+  return { filled: false, reason: 'cancelled_expired' }
+}
+
+// Диспозиция одного кандидата: baseOutcome ВСЕГДА посчитан (передан снаружи), decision —
+// от smcRefine. Возвращает запись с полями, которые понимает scripts/smc-report.mjs.
+function resolveDisposition({ H, symbol, side, T, sig, base, decision, sigArr, idx, lastAvail, fullBudgetMs }) {
+  const common = {
+    symbol, side, horizon: H.key, signalT: new Date(T).toISOString(),
+    action: decision.action, reasonCodes: decision.reasonCodes, smcScore: decision.smcScore,
+    baseNetR: base.netR, baseNetPnlPct: base.netPnlPct, baseStatus: base.status, baseClosedAt: base.closedAt,
+  }
+
+  if (decision.action === 'veto') {
+    return { ...common, disposition: 'skipped_veto', smcNetR: null, smcNetPnlPct: null, smcStatus: null }
+  }
+
+  if (decision.action === 'pass') {
+    // pass = сделка не меняется — смысла пересчитывать evaluateSignal ещё раз нет,
+    // исход идентичен базовому по построению.
+    return { ...common, disposition: 'taken_as_is', smcNetR: base.netR, smcNetPnlPct: base.netPnlPct, smcStatus: base.status }
+  }
+
+  if (decision.action === 'improve') {
+    // sl/tp — АБСОЛЮТНЫЕ уровни от рефайнера, riskPct пересчитан от новой ширины стопа
+    // (иначе r/netR считались бы по старому риску — грубая ошибка). Цель НЕ пересчитывается
+    // от стопа (см. §5.3 addendum координатора — контроль дважды показал, что геометрия
+    // «уже узкий стоп при той же цели» сама по себе не даёт выигрыша; improve здесь просто
+    // держит обе цифры как переданы рефайнером, независимо друг от друга).
+    const sl = decision.sl ?? sig.sl
+    const tp = decision.tp ?? sig.tp
+    const modified = { ...sig, sl, tp, riskPct: +((Math.abs(sig.entry - sl) / sig.entry) * 100).toFixed(6) }
+    const evalNow = Math.min(lastAvail, T + fullBudgetMs + 2 * 864e5)
+    const smcOutcome = evaluateSignal(modified, sigArr, evalNow)
+    if (!smcOutcome) return { ...common, disposition: 'taken_improved', smcNetR: null, smcNetPnlPct: null, smcStatus: 'open_unresolved' }
+    return { ...common, disposition: 'taken_improved', smcNetR: smcOutcome.netR, smcNetPnlPct: smcOutcome.netPnlPct, smcStatus: smcOutcome.status }
+  }
+
+  // defer: лимитник в POI/имбаланс. §4: createdAt становится моментом заполнения; §пуст.
+  // TTL тратится ИЗ бюджета MAX_AGE_DAYS, не добавляется — переданный maxAgeMs в
+  // evaluateSignal уменьшен на время ожидания заполнения.
+  const { pending } = decision
+  const scanNow = Math.min(lastAvail, T + fullBudgetMs + 2 * 864e5)
+  const fill = scanPendingFill(side, pending, sigArr, idx, scanNow)
+  if (!fill.filled) {
+    return { ...common, disposition: 'skipped_unfilled', smcNetR: null, smcNetPnlPct: null, smcStatus: fill.reason }
+  }
+  const waitMs = fill.ct - T
+  const reducedMaxAgeMs = Math.max(0, fullBudgetMs - waitMs)
+  const filledSig = {
+    ...sig,
+    entry: pending.limit,
+    sl: pending.sl,
+    tp: pending.tp,
+    riskPct: +((Math.abs(pending.limit - pending.sl) / pending.limit) * 100).toFixed(6),
+    createdAt: new Date(fill.ct).toISOString(),
+  }
+  const evalNowDeferred = Math.min(lastAvail, fill.ct + reducedMaxAgeMs + 2 * 864e5)
+  const smcOutcome = evaluateSignal(filledSig, sigArr, evalNowDeferred, { maxAgeMs: reducedMaxAgeMs })
+  if (!smcOutcome) {
+    return { ...common, disposition: 'taken_deferred', smcNetR: null, smcNetPnlPct: null, smcStatus: 'open_unresolved', filledAt: filledSig.createdAt }
+  }
+  return {
+    ...common, disposition: 'taken_deferred', smcNetR: smcOutcome.netR, smcNetPnlPct: smcOutcome.netPnlPct,
+    smcStatus: smcOutcome.status, filledAt: filledSig.createdAt,
+  }
+}
+
+async function replayHorizonSmc(H, symbols, hist, audit) {
+  const sigLimit = KLINE_LIMITS[H.sigTf]
+  const trendLimit = KLINE_LIMITS[H.trendTf]
+  const rsTf = H.sigTf === '1w' ? '1w' : '1d'
+  const rsLimit = KLINE_LIMITS[rsTf]
+  const btcLimit = 320
+
+  const tSet = new Set()
+  for (const s of symbols) {
+    const arr = hist[s][H.sigTf]
+    for (let i = WARMUP_BARS - 1; i < arr.length; i++) tSet.add(arr[i].ct)
+  }
+  const tAxis = [...tSet].sort((a, b) => a - b)
+  if (!tAxis.length) return { horizon: H.key, records: [], skipped: true, reason: 'no symbol reached warmup', tAxisLen: 0 }
+
+  const btcDaily = hist['BTCUSDT']?.['1d'] || []
+  const regimeCache = new Map()
+  function btcRegimeAsOf(T) {
+    if (regimeCache.has(T)) return regimeCache.get(T)
+    const win = windowEndingAt(btcDaily, btcLimit, T)
+    audit.windowChecks++
+    if (win.some((c) => c.ct > T)) audit.windowViolations++
+    const r = btcRegimeFrom(win)
+    regimeCache.set(T, r)
+    return r
+  }
+
+  const rsCache = new Map()
+  function rsRanksAsOf(T) {
+    if (rsCache.has(T)) return rsCache.get(T)
+    const fetched = symbols.map((s) => ({ symbol: s, tf: { [rsTf]: windowEndingAt(hist[s][rsTf] || [], rsLimit, T) } }))
+    for (const f of fetched) {
+      audit.windowChecks++
+      if ((f.tf[rsTf] || []).some((c) => c.ct > T)) audit.windowViolations++
+    }
+    const ranks = buildRsRanks(fetched, T)
+    if (H.rsDays) {
+      const weekly = H.sigTf === '1w'
+      const bars = weekly ? Math.max(2, Math.round(H.rsDays / 7)) : H.rsDays
+      const eligible = fetched.filter((f) => (f.tf[rsTf] || []).length >= bars + 1).length
+      const m = ranks[H.key]
+      audit.rsDenomChecks++
+      if (!m || m.size !== eligible) audit.rsDenomViolations++
+    }
+    rsCache.set(T, ranks)
+    return ranks
+  }
+
+  const closedTrades = [] // для calibrateFromClosed — на БАЗОВЫХ исходах, как и в базовом реплее
+  const openPositions = new Map()
+  const records = []
+  const progress = makeProgress(`replay-smc:${H.key}`, tAxis.length)
+
+  for (let ti = 0; ti < tAxis.length; ti++) {
+    const T = tAxis[ti]
+    progress.tick(ti + 1, `${records.length} recs`)
+    const calib = calibrateFromClosed(closedTrades.filter((t) => new Date(t.closedAt).getTime() <= T))
+    const btc = btcRegimeAsOf(T)
+    const rsRanks = rsRanksAsOf(T)
+
+    for (const symbol of symbols) {
+      if (symbol === 'BTCUSDT') continue
+      const sigArr = hist[symbol][H.sigTf]
+      const idx = findIdxAtOrBefore(sigArr, T)
+      if (idx < WARMUP_BARS - 1) continue
+      if (sigArr[idx].ct !== T) continue
+
+      const trendArr = hist[symbol][H.trendTf]
+      if (!trendArr || !trendArr.length) continue
+
+      const sigWindow = windowEndingAt(sigArr, sigLimit, T)
+      const trendWindow = windowEndingAt(trendArr, trendLimit, T)
+      audit.windowChecks += 2
+      if (sigWindow.some((c) => c.ct > T)) audit.windowViolations++
+      if (trendWindow.some((c) => c.ct > T)) audit.windowViolations++
+
+      const rs = rsRanks[H.key] ? rsRanks[H.key].get(symbol) : null
+      const u = { symbol, base: symbol.slice(0, -4) }
+      const cand = analyzeHorizon(u, H, sigWindow, trendWindow, btc, null, T, rs ?? null, calib)
+      if (!cand) continue
+
+      const key = `${symbol}|${cand.side}|${H.key}`
+      const blocked = openPositions.has(key) && openPositions.get(key).closedAtMs > T
+      if (blocked) continue
+
+      const sig = { ...cand, id: `${cand.base}-${cand.side}-${H.key}-${T}`, createdAt: new Date(T).toISOString(), status: 'open' }
+      const lastAvail = sigArr[sigArr.length - 1].ct
+      const fullBudgetMs = (MAX_AGE_DAYS[H.key] || 12) * 864e5
+      const evalNow = Math.min(lastAvail, T + fullBudgetMs + 2 * 864e5)
+
+      // baseOutcome — ВСЕГДА, независимо от решения SMC (§5.1, ключевой момент парности).
+      const base = evaluateSignal(sig, sigArr, evalNow)
+      if (!base) {
+        // не разрешилось в доступной истории — как и в базовом реплее, блокируем ключ
+        // навсегда и не создаём запись (позиция "ещё открыта", не в статистике).
+        openPositions.set(key, { closedAtMs: Infinity })
+        continue
+      }
+      audit.outcomeChecks++
+      const firstAfter = sigArr.find((k) => k.t > T)
+      if (!firstAfter || firstAfter.t <= T) audit.outcomeViolations++
+      closedTrades.push(base)
+
+      // SMC-проверка окна (§3 инвариант 3): sigWindow/trendWindow, переданные smcRefine, —
+      // ровно то же окно ct<=T, что видела analyzeHorizon, ни одной свечи сверх него.
+      audit.smcWindowChecks += 2
+      if (sigWindow.some((c) => c.ct > T)) audit.smcWindowViolations++
+      if (trendWindow.some((c) => c.ct > T)) audit.smcWindowViolations++
+
+      const decision = smcRefine(cand, { sigCandles: sigWindow, trendCandles: trendWindow })
+      const rec = resolveDisposition({ H, symbol, side: cand.side, T, sig, base, decision, sigArr, idx, lastAvail, fullBudgetMs })
+      records.push(rec)
+
+      // Блокировка по closedAt БАЗОВОГО исхода — ключевой момент §5.1: без этого потоки
+      // разъедутся (вето освобождает ключ раньше, на следующем баре появится сигнал,
+      // которого у базы не было в этот момент — она "сидела в сделке").
+      openPositions.set(key, { closedAtMs: new Date(base.closedAt).getTime() })
+    }
+  }
+
+  progress.done()
+  return { horizon: H.key, records, tAxisLen: tAxis.length, symbolsUsed: symbols.length }
+}
+
+function summarizeDispositions(records) {
+  const counts = { taken_as_is: 0, taken_improved: 0, taken_deferred: 0, skipped_unfilled: 0, skipped_veto: 0 }
+  let avoidedLossNetR = 0
+  let missedProfitNetR = 0
+  let deltaOnIntersectionNetR = 0
+  let baseNetPnlPct = 0
+  let smcNetPnlPct = 0
+  let baseSumNetR = 0
+  let smcTradeCount = 0
+  const byDisposition = {}
+  for (const r of records) {
+    counts[r.disposition] = (counts[r.disposition] || 0) + 1
+    baseNetPnlPct += r.baseNetPnlPct || 0
+    baseSumNetR += r.baseNetR || 0
+    if (r.disposition === 'skipped_veto') avoidedLossNetR += r.baseNetR || 0
+    if (r.disposition === 'skipped_unfilled') missedProfitNetR += r.baseNetR || 0
+    if (r.smcNetR != null) {
+      deltaOnIntersectionNetR += r.smcNetR - r.baseNetR
+      smcNetPnlPct += r.smcNetPnlPct || 0
+      smcTradeCount++
+      const d = (byDisposition[r.disposition] ||= { n: 0, sumBase: 0, sumSmc: 0 })
+      d.n++
+      d.sumBase += r.baseNetR
+      d.sumSmc += r.smcNetR
+    }
+  }
+  const perDisposition = Object.fromEntries(
+    Object.entries(byDisposition).map(([k, v]) => [
+      k,
+      { n: v.n, sumBaseNetR: +v.sumBase.toFixed(3), sumSmcNetR: +v.sumSmc.toFixed(3), deltaNetR: +(v.sumSmc - v.sumBase).toFixed(3) },
+    ]),
+  )
+  return {
+    counts,
+    totalRecords: records.length,
+    avoidedLossNetR: +avoidedLossNetR.toFixed(3),
+    missedProfitNetR: +missedProfitNetR.toFixed(3),
+    deltaOnIntersectionNetR: +deltaOnIntersectionNetR.toFixed(3),
+    baseNetPnlPct: +baseNetPnlPct.toFixed(2),
+    smcNetPnlPct: +smcNetPnlPct.toFixed(2),
+    baseSumNetR: +baseSumNetR.toFixed(3),
+    baseTradeCount: records.length,
+    smcTradeCount,
+    perDisposition,
+  }
+}
+
+async function runReplaySmc() {
+  await mkdir(BT_DIR, { recursive: true })
+  const symbols = await loadOrCreateSymbolSnapshot(UNIVERSE_TOP_N)
+  console.log(`[SMC] Загружаю кэш истории для ${symbols.length} символов...`)
+  const hist = await loadAllHistory(symbols)
+
+  const horizonFilter = flag('horizons')
+  const wantedKeys = horizonFilter ? String(horizonFilter).split(',') : HORIZONS.map((h) => h.key)
+  const audit = auditCountersSmc()
+  const allRecords = []
+  const perHorizon = []
+  for (const H of HORIZONS) {
+    if (!wantedKeys.includes(H.key)) continue
+    console.log(`\n== [SMC] Реплей горизонта ${H.key} (${H.sigTf}/${H.trendTf}) ==`)
+    const t0 = Date.now()
+    const res = await replayHorizonSmc(H, symbols, hist, audit)
+    console.log(`  ${res.records.length} записей (диспозиций), T-axis=${res.tAxisLen} тиков, за ${((Date.now() - t0) / 1000).toFixed(1)}с`)
+    allRecords.push(...res.records)
+    perHorizon.push({ horizon: H.key, records: res.records.length, tAxisLen: res.tAxisLen, skipped: !!res.skipped, reason: res.reason })
+  }
+
+  const summary = summarizeDispositions(allRecords)
+  const allAssertsPass =
+    audit.windowViolations === 0 && audit.outcomeViolations === 0 && audit.rsDenomViolations === 0 && audit.smcWindowViolations === 0
+  const auditReport = { generatedAt: new Date().toISOString(), ...audit, allAssertsPass, perHorizon }
+
+  const out = {
+    generatedAt: new Date().toISOString(),
+    tag: TAG,
+    smcParams: { swingN: SMC_SWING_N, breakMode: SMC_BREAK_MODE, deferExpiryBars: SMC_DEFER_EXPIRY_BARS, gates: [...SMC_GATES] },
+    audit: auditReport,
+    summary,
+    records: allRecords,
+  }
+  await writeFile(SMC_TRADES_PATH, JSON.stringify(out), 'utf8')
+
+  console.log(`\n=== SMC lookahead audit ===`)
+  console.log(`(a) window checks: ${audit.windowChecks - audit.windowViolations}/${audit.windowChecks} ok`)
+  console.log(`(b) outcome first-bar checks: ${audit.outcomeChecks - audit.outcomeViolations}/${audit.outcomeChecks} ok`)
+  console.log(`(c) RS-denominator checks: ${audit.rsDenomChecks - audit.rsDenomViolations}/${audit.rsDenomChecks} ok`)
+  console.log(`(d) SMC window checks: ${audit.smcWindowChecks - audit.smcWindowViolations}/${audit.smcWindowChecks} ok`)
+  console.log(allAssertsPass ? 'AUDIT: PASS (0 violations)' : 'AUDIT: FAIL — see output above')
+
+  console.log(`\n=== Диспозиции (${allRecords.length} записей) ===`)
+  for (const [k, v] of Object.entries(summary.counts)) console.log(`  ${k}: ${v}`)
+  console.log(`Избежанный убыток (Σ baseNetR по skipped_veto): ${summary.avoidedLossNetR}`)
+  console.log(`Упущенная прибыль (Σ baseNetR по skipped_unfilled): ${summary.missedProfitNetR}`)
+  console.log(`Дельта на пересечении (Σ smcNetR − Σ baseNetR, все taken_*): ${summary.deltaOnIntersectionNetR}`)
+  for (const [k, v] of Object.entries(summary.perDisposition)) {
+    console.log(`  ${k.padEnd(16)} n=${String(v.n).padStart(4)}  Σbase=${v.sumBaseNetR}  Σsmc=${v.sumSmcNetR}  дельта=${v.deltaNetR}`)
+  }
+  console.log(`Σ netPnl base (все решённые кандидаты): ${summary.baseNetPnlPct}%`)
+  console.log(`Σ netPnl smc (taken_* только): ${summary.smcNetPnlPct}%`)
+  console.log(`\nЗаписано в ${SMC_TRADES_PATH}`)
+}
+
 // ── P0-6: eval ──
 function mean(xs) { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0 }
 function quantile(sorted, q) {
@@ -648,11 +979,13 @@ async function runEval() {
 
 async function main() {
   if (flag('pull')) return runPull()
-  if (flag('replay')) return runReplay()
+  // --smc=refine — единственное, за счёт чего расходится путь --replay; без флага (или с
+  // любым другим значением) поведение --replay бит-в-бит прежнее (P0-1/§3 инвариант 1).
+  if (flag('replay')) return flag('smc') === 'refine' ? runReplaySmc() : runReplay()
   if (flag('eval')) return runEval()
   console.log('Usage: node scripts/backtest.mjs --pull|--replay|--eval [options]')
   console.log('  --pull [--years=3]')
-  console.log('  --replay [--horizons=scalp,mid,long,veryLong]')
+  console.log('  --replay [--horizons=scalp,mid,long,veryLong] [--smc=refine]')
   console.log('  --eval [--fill=close|next-open|both]')
 }
 

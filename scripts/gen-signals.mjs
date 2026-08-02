@@ -45,9 +45,21 @@ const TOP_N = 100
 // SCORE_MIN_OVERRIDE позволяет свипать харнессом без правки файла (backtest.mjs).
 export const SCORE_MIN = Number(process.env.SCORE_MIN_OVERRIDE) || 42 // минимальная сила сигнала (фильтр качества)
 export const RR_MIN = 2 // минимальное соотношение прибыль/риск — ниже 2:1 не сохраняем
-export const ATR_MULT = 1.8
-export const RR = 2.5
-export const RR_CAP = 2.5 // Phase 1 (P1-1): жёсткий потолок RR — было score≥80/85/90 → 3/4/6
+// Ширина стопа. Оверрайд добавлен для контрольной группы SMC-эксперимента: замер MAE на
+// книге v3-focus (3187 сделок) показал, что выигрыши подходят к стопу медиана 0.37R / p90
+// 0.84R, а проигрыши пробивают его насквозь (медиана 1.17R) — то есть сужение стопа само по
+// себе поднимает ожидание, безотносительно SMC. Без этой ручки эффект «структурного» стопа
+// нельзя отделить от эффекта «просто более узкого» (см. docs/SMC_ENGINE_SPEC.md, раздел 5.3).
+// Дефолт не изменён.
+export const ATR_MULT = Number(process.env.ATR_MULT_OVERRIDE) || 1.8
+// Оверрайд — для контрольной группы «узкий стоп при неизменной цене цели»: одно лишь
+// уменьшение ATR_MULT сжимает и цель тоже (tp = rr × slDist), поэтому изолировать эффект
+// узкого стопа можно только подняв RR обратно. Дефолт не изменён.
+export const RR = Number(process.env.RR_OVERRIDE) || 2.5
+// Phase 1 (P1-1): жёсткий потолок RR — было score≥80/85/90 → 3/4/6. Оверрайд добавлен для
+// той же контрольной группы, что и RR_OVERRIDE: без снятия потолка поднятый RR не доедет до
+// dynamicRR (она возвращает min(baseRR, RR_CAP)). Дефолт не изменён.
+export const RR_CAP = Number(process.env.RR_CAP_OVERRIDE) || 2.5
 export const MAX_AGE_DAYS = { scalp: 4, mid: 12, long: 45, veryLong: 400 } // срок жизни по горизонту
 
 // Маркер движка. Каждый сигнал, произведённый ЭТИМ движком (Phase 0 офлайн-харнесс + Phase 1
@@ -645,7 +657,14 @@ export function analyzeHorizon(u, H, sigCandles, trendCandles, btc, newsHit, now
 }
 
 // ── оценка исхода ──
-export function evaluateSignal(sig, candles, now) {
+// opts.maxAgeMs [аддитивно, для SMC-харнеса]: переопределяет срок жизни по умолчанию
+// (MAX_AGE_DAYS[sig.horizon]). Нужен backtest.mjs для отложенных (defer) SMC-входов —
+// там бюджет ожидания заполнения лимитника ВЫЧИТАЕТСЯ из общего срока жизни сделки, а не
+// добавляется к нему (SMC_ENGINE_SPEC.md §4); без этого параметра пришлось бы либо трогать
+// MAX_AGE_DAYS (общий для всех вызывающих — сломало бы дефолтное поведение), либо
+// дублировать всю эту функцию в backtest.mjs. Без 4-го аргумента (или без maxAgeMs в нём)
+// поведение бит-в-бит прежнее — опция инертна для всех существующих вызовов.
+export function evaluateSignal(sig, candles, now, opts = {}) {
   const created = new Date(sig.createdAt).getTime()
   const after = closed(candles, now).filter((k) => k.t > created)
   let best = sig.side === 'long' ? -Infinity : Infinity // максимум хода в сторону прибыли (MFE)
@@ -663,7 +682,7 @@ export function evaluateSignal(sig, candles, now) {
       if (k.l <= sig.tp) return closeSig(sig, 'tp', sig.tp, k.ct, best, worst)
     }
   }
-  const maxAge = (MAX_AGE_DAYS[sig.horizon] || 12) * 864e5
+  const maxAge = opts.maxAgeMs ?? (MAX_AGE_DAYS[sig.horizon] || 12) * 864e5
   if (now - created > maxAge) {
     const lastK = after.length ? after[after.length - 1] : null
     return closeSig(sig, 'expired', lastK ? lastK.c : sig.entry, lastK ? lastK.ct : now, best, worst)

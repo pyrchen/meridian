@@ -2,7 +2,7 @@
 // Запуск: node scripts/smc.test.mjs — код возврата 1 при любом провале.
 
 import assert from 'node:assert/strict'
-import { swings, structure, fvg, orderBlocks, breaker, mitigation, premiumDiscount, sweep, smcRefine, findFreshPOI } from './smc.mjs'
+import { swings, structure, fvg, orderBlocks, breaker, mitigation, premiumDiscount, sweep, smcRefine, findFreshPOI, smcGenerate } from './smc.mjs'
 
 let passCount = 0
 let failCount = 0
@@ -372,6 +372,141 @@ test('smcRefine: vetoes a signal with no target magnet ahead of price (flat mark
   const res = smcRefine(signal, { sigCandles: flat })
   assert.equal(res.action, 'veto')
   assert.ok(res.reasonCodes.some((r) => r.startsWith('veto:')))
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// smcGenerate() — потребитель B (§6.3): свип → слом → FVG → лимитник
+// ═══════════════════════════════════════════════════════════════════
+//
+// Восьмишаговая последовательность требует координированной синтетики: свинг-хай (уровень
+// будущего слома), свинг-лоу (уровень будущего свипа), сам свип, слом ПОСЛЕ свипа с
+// импульсом ≥1.5×ATR и FVG в окне слома (иначе не пройдёт фильтр ложного слома), FVG от
+// импульса (зона входа) и ОТДЕЛЬНАЯ незакрытая зона выше — иначе нет цели-магнита (гейт 2
+// не смотрит на «уже пройденные» уровни — см. находку ниже). n=3 (компактный фрактал, тот
+// же приём что и в фикстурах breaker/mitigation выше) через ctx.swingN.
+//
+// smcGenerate требует sigCandles.length>=60 (зеркалит f.length<60 гейт analyzeHorizon) —
+// отсюда 40 «плоских» свечей в начале: o=h≈l=c, нигде нет строгого неравенства, поэтому НИ
+// ОДНА не регистрируется свинг-точкой; нужны только чтобы ATR(14) и общая длина окна были
+// реалистичными, на геометрию сигнала не влияют.
+
+function buildGenFixture({ sweepOn = true, breakBodyClose = true } = {}) {
+  const cs = []
+  let i = 0
+  const push = (o, h, l, cl) => cs.push(c(i++, o, h, l, cl))
+  for (let p = 0; p < 40; p++) push(100, 100.5, 99.5, 100) // ATR/длина warm-up, без свингов
+  // Цель-магнит (гейт 2): медвежий FVG [141.5,170], сформирован ЗАДОЛГО до сделки и НИКОГДА
+  // не тестируется позже (пробой ниже дотягивается лишь до 116) — остаётся открытым, поэтому
+  // findTargetMagnet находит его как «незакрытый имбаланс впереди цены» (лонг: z.lo>price).
+  push(172, 173, 170, 171) // c1 гэпа: low=170
+  push(170.5, 172, 165, 168)
+  push(140, 141.5, 115, 118) // c3 гэпа: high=141.5 < c1.low(170) ⇒ медвежий гэп [141.5,170]
+  push(118, 119, 99, 100) // переход вниз, high всегда < 141.5 — зона остаётся нетронутой
+  // Свинг-хай @103 — уровень, который позже сломает импульс (гейт 5).
+  push(100, 101, 99, 100.2)
+  push(100.2, 100.6, 98.5, 99)
+  push(99, 100.2, 98.3, 99.8)
+  push(99.8, 100.5, 99, 100)
+  push(100, 103, 99.5, 102.5) // свинг HIGH @103
+  push(102.5, 102.6, 100, 100.5)
+  push(100.5, 100.6, 97, 97.5)
+  push(97.5, 98, 94, 94.5)
+  push(94.5, 95, 90, 90.5) // свинг LOW @90 — уровень будущего свипа (гейт 4)
+  push(90.5, 92, 90.2, 91.5)
+  push(91.5, 93, 91, 92.5)
+  push(92.5, 94, 92, 93.5)
+  push(93.5, 95, 93, 94.5)
+  push(94.5, 96, 94, 95.5)
+  push(95.5, 97, 95, 96.5)
+  if (sweepOn) {
+    // Свип свинг-лоу@90: тень пробивает вниз, закрытие возвращается выше уровня.
+    push(96.5, 97, 88, 91)
+    // Свеча с ТЕМ ЖЕ минимумом (88) — без неё сама свечная свипа зарегистрировалась бы
+    // НОВЫМ свинг-лоу (она ниже соседей), и findPreEntrySweep искал бы свип уже ЭТОГО
+    // уровня, а не исходного @90 — совпадающий минимум ломает строгое неравенство свинга
+    // с обеих сторон, ни одна из двух не регистрируется.
+    push(89.5, 90, 88, 89.7)
+  } else {
+    // Вариант БЕЗ свипа: цена весь отрезок держится выше 90 (тоже на совпадающем минимуме
+    // @92, чтобы форма разметки осталась той же — меняется только гейт 4).
+    push(96.5, 97, 92, 94)
+    push(93.5, 95, 92, 94.5)
+  }
+  // Слом свинг-хая@103. Минимум держим у 93 — заметно выше и свипнутого уровня (90), и
+  // соседних минимумов, иначе широкий диапазон этой свечи сам ложно засчитался бы «свипом
+  // @90» (sweep() не разбирает контекст, просто ищет тень-ниже-уровня/закрытие-выше во всём
+  // окне поиска) или новым свинг-лоу. В wick-only варианте close=91 держит ТЕЛО ниже 103
+  // (слома по телу нет), но нога всё равно достаточно большая (~12) для фильтра
+  // ложного слома (импульс/ATR ≥1.5) — иначе «нет сигнала» объяснялось бы падением этого
+  // фильтра, а не режимом слома, который здесь и проверяется.
+  const breakClose = breakBodyClose ? 115 : 91
+  push(90.5, 116, 93, breakClose)
+  // c3 FVG зоны входа (c1 — свеча с минимумом 88/92 выше, high=90/92): лимитник встанет на
+  // её ближний край. Open зафиксирован на 115 (валиден в обоих вариантах; в дефолтном он
+  // РАВЕН close предыдущей свечи — иначе 2-свечная проверка bull/bear FVG между ними
+  // породила бы лишнюю близкую зону, которая перебила бы дальний магнит по .lo).
+  push(115, 118, 104, 106)
+  // Финальная свеча — цена в дискаунте дилинг-рейнджа [90,118].
+  push(106, 108, 97, 98)
+  return cs
+}
+
+// Тренд-ТФ для биаса (гейт 1): свинг-хай@103, сломанный телом выше — биас long.
+const genTrend = [
+  c(0, 100, 101, 99, 100.5),
+  c(1, 100.5, 103, 100, 102),
+  c(2, 102, 102.5, 99, 100),
+  c(3, 100, 108, 99.5, 107),
+]
+
+test('smcGenerate: valid long signal — sweep, then BOS, then retracement into the impulse FVG', () => {
+  const cs = buildGenFixture()
+  const cand = smcGenerate({ symbol: 'TESTUSDT', base: 'TEST', horizon: 'mid', timeframe: '4h', sigCandles: cs, trendCandles: genTrend, swingN: 3 })
+  assert.ok(cand, 'ожидали валидный сигнал на подготовленной свип→слом→FVG последовательности')
+  assert.equal(cand.side, 'long')
+  // Вход — ближний край FVG от импульсной ноги слома (§6.3 п.6): entryLevel = c3.low.
+  assert.equal(cand.entry, 104)
+  // Стоп — ЗА экстремумом свипа (§6.3 п.7), не за край зоны входа (90) — экстремум ниже.
+  assert.equal(cand.sl, 88)
+  // Тейк — уровень магнита (§6.3 п.2/п.8): дальний край незакрытого FVG впереди цены.
+  assert.equal(cand.tp, 165)
+  assert.ok(cand.rr >= 2, `rr должен пройти отбраковку RR_MIN: ${cand.rr}`)
+  assert.ok(cand.pending && cand.pending.limit === cand.entry && cand.pending.invalidate === cand.sl)
+})
+
+test('smcGenerate: no signal when the sweep is removed (gate 4 fails)', () => {
+  const cs = buildGenFixture({ sweepOn: false })
+  const cand = smcGenerate({ symbol: 'TESTUSDT', base: 'TEST', horizon: 'mid', timeframe: '4h', sigCandles: cs, trendCandles: genTrend, swingN: 3 })
+  assert.equal(cand, null, 'без свипа перед сломом сетапа по спеке нет вовсе (§6.3 п.4)')
+})
+
+test('smcGenerate: no signal when the confirming BOS is wick-only under body mode (gate 5 fails)', () => {
+  const cs = buildGenFixture({ breakBodyClose: false })
+  const bodyCand = smcGenerate({ symbol: 'TESTUSDT', base: 'TEST', horizon: 'mid', timeframe: '4h', sigCandles: cs, trendCandles: genTrend, swingN: 3, breakMode: 'body' })
+  assert.equal(bodyCand, null, 'тело не закрылось за свинг-хаем — в режиме body слома не было вовсе')
+  // Контроль: ТЕ ЖЕ свечи в режиме wick сигнал находят — разница только в SMC_BREAK_MODE,
+  // а не в случайно сломанной по пути фикстуре.
+  const wickCand = smcGenerate({ symbol: 'TESTUSDT', base: 'TEST', horizon: 'mid', timeframe: '4h', sigCandles: cs, trendCandles: genTrend, swingN: 3, breakMode: 'wick' })
+  assert.ok(wickCand, 'та же фикстура в режиме wick обязана дать сигнал — иначе тест выше ничего не доказывает про режим')
+})
+
+test('smcGenerate: no signal when no target magnet exists ahead of price (gate 2 fails)', () => {
+  // [находка] Дискаунт-локация (гейт 3) и «есть магнит впереди» (гейт 2, фолбэк на пул
+  // ликвидности) в этой реализации структурно СЦЕПЛЕНЫ: дилинг-рейндж якорится на ПОСЛЕДНИЙ
+  // свинг + ближайший противоположный (dealingRange), и его верхняя граница ВСЕГДА сама
+  // является зарегистрированной свинг-точкой типа 'high' — findTargetMagnet.pool берёт ЛЮБУЮ
+  // такую точку с ценой выше текущей без исключений (в отличие от FVG-ветки, для пулов нет
+  // проверки «уже смягчена»). Значит, если гейт 3 (дискаунт) прошёл, у гейта 2 почти всегда
+  // уже есть готовый кандидат — это же верхняя граница РЕЙНДЖА. Поэтому «нет магнита» здесь
+  // проверяем на плоском рынке: НЕТ ни одного свинга вовсе ⇒ dealingRange() возвращает null
+  // (гейт 3 падает первым по вычислению) И независимо от этого явно нет ни одной FVG-зоны,
+  // ни одной свинг-точки для пула (гейт 2 такой же пустой). Более узкий тест — где гейт 3
+  // проходит, а гейт 2 сам по себе терпит неудачу, — при текущей архитектуре генератора
+  // геометрически недостижим для лонга (симметрично и для шорта); см. отчёт агента.
+  const flatSig = []
+  for (let i = 0; i < 70; i++) flatSig.push(c(i, 100, 100.2, 99.8, 100))
+  const cand = smcGenerate({ symbol: 'TESTUSDT', base: 'TEST', horizon: 'mid', timeframe: '4h', sigCandles: flatSig, trendCandles: genTrend, swingN: 3 })
+  assert.equal(cand, null, 'плоский рынок: ни дилинг-рейнджа, ни FVG, ни пула ликвидности — магнита нет')
 })
 
 // ═══════════════════════════════════════════════════════════════════

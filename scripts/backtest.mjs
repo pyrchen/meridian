@@ -22,9 +22,13 @@ import {
   calibrateFromClosed, aggStats, computeStats, btcRegimeFrom,
   HORIZONS, MAX_AGE_DAYS, STRATUM_MIN, KLINE_LIMITS,
 } from './gen-signals.mjs'
-// SMC-слой (--smc=refine, см. docs/SMC_ENGINE_SPEC.md §5.1). Импорт сам по себе не влияет
-// на default-путь --replay без --smc — вызывается только из runReplaySmc() ниже.
-import { smcRefine, SMC_SWING_N, SMC_BREAK_MODE, SMC_DEFER_EXPIRY_BARS, SMC_GATES } from './smc.mjs'
+// SMC-слой (--smc=refine|generate, см. docs/SMC_ENGINE_SPEC.md §5.1/§6.3). Импорт сам по себе
+// не влияет на default-путь --replay без --smc — вызывается только из runReplaySmc()/
+// runReplaySmcGen() ниже.
+import {
+  smcRefine, SMC_SWING_N, SMC_BREAK_MODE, SMC_DEFER_EXPIRY_BARS, SMC_GATES,
+  smcGenerate, SMC_GEN_SWEEP_LOOKBACK, SMC_GEN_MAX_WAIT_BARS, SMC_FAKEBOS_ATR_MULT,
+} from './smc.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(__dirname, '..')
@@ -47,6 +51,8 @@ const REPORT_PATH = resolve(BT_DIR, `report${TAG}.json`)
 // scripts/smc-report.mjs читает ровно этот путь (`smc-${rawTag}.json`) — TAG уже несёт
 // свой дефис (`-${tag}`), поэтому здесь БЕЗ дополнительного дефиса.
 const SMC_TRADES_PATH = resolve(BT_DIR, `smc${TAG}.json`)
+// Поток B (генератор, §6.3) — та же конвенция именования, TAG уже несёт свой дефис.
+const SMC_GEN_TRADES_PATH = resolve(BT_DIR, `smcgen${TAG}.json`)
 
 const BINANCE = 'https://data-api.binance.vision'
 const PULL_INTERVALS = ['1h', '4h', '1d', '1w']
@@ -815,6 +821,182 @@ async function runReplaySmc() {
   console.log(`\nЗаписано в ${SMC_TRADES_PATH}`)
 }
 
+// ── SMC-генератор — поток B (--smc=generate, SMC_ENGINE_SPEC.md §6.3) ──
+//
+// Не переиспользует тело replayHorizon()/replayHorizonSmc() — та же причина, что у них
+// друг с другом: любой общий рефакторинг рискует незаметно задеть БАЗОВЫЙ путь и нарушить
+// критерий приёмки №1 (бит-в-бит --replay без --smc). Здесь нет analyzeHorizon вовсе —
+// smcGenerate() сам решает сторону/вход/стоп/цель, поэтому цикл проще (нет calib/btcRegime/
+// rsRanks — генератор их не потребляет, §6.3 не упоминает ни BTC-режим, ни RS в своих 8
+// шагах) и внутри другой: кандидат — это ОТЛОЖЕННЫЙ лимитник (§6.3 «Дополнительно»), а не
+// немедленный вход по close, поэтому ждём заполнения через scanPendingFill() (та же функция,
+// что и у рефайнера §4 — модель отложенного входа не завязана на то, ОТКУДА взялся pending).
+
+// Блокировка ключа `symbol|side|horizon` для НЕзаполненного кандидата (инвалидирован раньше
+// заполнения, либо истёк срок ожидания) [вывод]: спека не описывает блокировку отдельно для
+// генератора («position blocking as usual» — задание координатора), поэтому берём тот же
+// принцип, что и у остальных путей харнесса — ключ занят РОВНО на время жизни гипотетической
+// позиции. Здесь это время жизни самого отложенного ордера: от T (момент детекции кандидата)
+// до бара отмены/истечения. Без этого на СЛЕДУЮЩЕМ же баре мог бы появиться новый кандидат
+// по тому же ключу, пока предыдущий отложенный ордер ещё «жив» на графике — задвоение потока.
+function cancelCloseMs(sigArr, startIdx, expiryBars) {
+  const lastIdx = Math.min(startIdx + expiryBars, sigArr.length - 1)
+  return sigArr[lastIdx].ct
+}
+
+async function replayHorizonSmcGen(H, symbols, hist, audit) {
+  const sigLimit = KLINE_LIMITS[H.sigTf]
+  const trendLimit = KLINE_LIMITS[H.trendTf]
+
+  const tSet = new Set()
+  for (const s of symbols) {
+    const arr = hist[s][H.sigTf]
+    for (let i = WARMUP_BARS - 1; i < arr.length; i++) tSet.add(arr[i].ct)
+  }
+  const tAxis = [...tSet].sort((a, b) => a - b)
+  if (!tAxis.length) return { horizon: H.key, trades: [], skipped: true, reason: 'no symbol reached warmup', tAxisLen: 0 }
+
+  const openPositions = new Map()
+  const trades = []
+  const counts = { candidates: 0, filled: 0, cancelledInvalidated: 0, cancelledExpired: 0, unresolved: 0 }
+  const progress = makeProgress(`replay-smcgen:${H.key}`, tAxis.length)
+
+  for (let ti = 0; ti < tAxis.length; ti++) {
+    const T = tAxis[ti]
+    progress.tick(ti + 1, `${trades.length} trades`)
+
+    for (const symbol of symbols) {
+      if (symbol === 'BTCUSDT') continue
+      const sigArr = hist[symbol][H.sigTf]
+      const idx = findIdxAtOrBefore(sigArr, T)
+      if (idx < WARMUP_BARS - 1) continue
+      if (sigArr[idx].ct !== T) continue
+
+      const trendArr = hist[symbol][H.trendTf]
+      if (!trendArr || !trendArr.length) continue
+
+      const sigWindow = windowEndingAt(sigArr, sigLimit, T)
+      const trendWindow = windowEndingAt(trendArr, trendLimit, T)
+      audit.windowChecks += 2
+      if (sigWindow.some((c) => c.ct > T)) audit.windowViolations++
+      if (trendWindow.some((c) => c.ct > T)) audit.windowViolations++
+
+      const cand = smcGenerate({
+        symbol, base: symbol.slice(0, -4), horizon: H.key, timeframe: H.sigTf,
+        sigCandles: sigWindow, trendCandles: trendWindow,
+      })
+      if (!cand) continue
+      counts.candidates++
+
+      const key = `${symbol}|${cand.side}|${H.key}`
+      const blocked = openPositions.has(key) && openPositions.get(key).closedAtMs > T
+      if (blocked) continue
+
+      const fullBudgetMs = (MAX_AGE_DAYS[H.key] || 12) * 864e5
+      const lastAvail = sigArr[sigArr.length - 1].ct
+      const scanNow = Math.min(lastAvail, T + fullBudgetMs + 2 * 864e5)
+      const fill = scanPendingFill(cand.side, cand.pending, sigArr, idx, scanNow)
+
+      if (!fill.filled) {
+        if (fill.reason === 'cancelled_invalidated') counts.cancelledInvalidated++
+        else counts.cancelledExpired++
+        openPositions.set(key, { closedAtMs: cancelCloseMs(sigArr, idx, cand.pending.expiryBars) })
+        continue
+      }
+      counts.filled++
+
+      // §4: createdAt = момент ЗАПОЛНЕНИЯ, не момент детекции — иначе MAX_AGE_DAYS считается
+      // неверно. TTL ожидания вычитается из бюджета срока жизни, а не добавляется к нему.
+      const waitMs = fill.ct - T
+      const reducedMaxAgeMs = Math.max(0, fullBudgetMs - waitMs)
+      const markets = H.key === 'scalp' ? ['futures'] : cand.side === 'long' ? ['spot', 'futures'] : ['futures']
+      const filledSig = {
+        symbol: cand.symbol, base: cand.base, side: cand.side, horizon: cand.horizon, timeframe: cand.timeframe,
+        markets,
+        entry: cand.pending.limit,
+        sl: cand.pending.invalidate,
+        tp: cand.tp,
+        riskPct: +((Math.abs(cand.pending.limit - cand.pending.invalidate) / cand.pending.limit) * 100).toFixed(6),
+        createdAt: new Date(fill.ct).toISOString(),
+        status: 'open',
+      }
+      const evalNow = Math.min(lastAvail, fill.ct + reducedMaxAgeMs + 2 * 864e5)
+      const outcome = evaluateSignal(filledSig, sigArr, evalNow, { maxAgeMs: reducedMaxAgeMs })
+      if (!outcome) {
+        // не разрешилось в доступной истории — как и в остальных путях харнесса, блокируем
+        // ключ навсегда (ещё "открыта"), не в статистике.
+        counts.unresolved++
+        openPositions.set(key, { closedAtMs: Infinity })
+        continue
+      }
+      audit.outcomeChecks++
+      const firstAfter = sigArr.find((k) => k.t > fill.ct)
+      if (!firstAfter || firstAfter.t <= fill.ct) audit.outcomeViolations++
+
+      const decorated = {
+        ...outcome,
+        signalT: new Date(T).toISOString(), // момент ДЕТЕКЦИИ кандидата — для пересечения с базой (§6.3 «Измерение»)
+        rrPlanned: cand.rr,
+        atrAtSignal: cand.atr,
+        reasonCodes: cand.reasonCodes,
+        costPctVal: tradeCostPct(filledSig, outcome.status),
+      }
+      trades.push(decorated)
+      openPositions.set(key, { closedAtMs: new Date(outcome.closedAt).getTime() })
+    }
+  }
+
+  progress.done()
+  return { horizon: H.key, trades, tAxisLen: tAxis.length, symbolsUsed: symbols.length, counts }
+}
+
+async function runReplaySmcGen() {
+  await mkdir(BT_DIR, { recursive: true })
+  const symbols = await loadOrCreateSymbolSnapshot(UNIVERSE_TOP_N)
+  console.log(`[SMC-GEN] Загружаю кэш истории для ${symbols.length} символов...`)
+  const hist = await loadAllHistory(symbols)
+
+  const horizonFilter = flag('horizons')
+  const wantedKeys = horizonFilter ? String(horizonFilter).split(',') : HORIZONS.map((h) => h.key)
+  const audit = auditCounters()
+  const allTrades = []
+  const perHorizon = []
+  const countsTotal = { candidates: 0, filled: 0, cancelledInvalidated: 0, cancelledExpired: 0, unresolved: 0 }
+  for (const H of HORIZONS) {
+    if (!wantedKeys.includes(H.key)) continue
+    console.log(`\n== [SMC-GEN] Реплей горизонта ${H.key} (${H.sigTf}/${H.trendTf}) ==`)
+    const t0 = Date.now()
+    const res = await replayHorizonSmcGen(H, symbols, hist, audit)
+    console.log(`  ${res.trades.length} закрытых сделок из ${res.counts.candidates} кандидатов (${res.counts.filled} заполнено, ${res.counts.cancelledInvalidated} инвалидировано, ${res.counts.cancelledExpired} истекло), T-axis=${res.tAxisLen} тиков, за ${((Date.now() - t0) / 1000).toFixed(1)}с`)
+    allTrades.push(...res.trades)
+    perHorizon.push({ horizon: H.key, trades: res.trades.length, tAxisLen: res.tAxisLen, counts: res.counts, skipped: !!res.skipped, reason: res.reason })
+    for (const k of Object.keys(countsTotal)) countsTotal[k] += res.counts[k] || 0
+  }
+
+  const allAssertsPass = audit.windowViolations === 0 && audit.outcomeViolations === 0 && audit.rsDenomViolations === 0
+  const auditReport = { generatedAt: new Date().toISOString(), ...audit, allAssertsPass, perHorizon }
+
+  const out = {
+    generatedAt: new Date().toISOString(),
+    tag: TAG,
+    smcGenParams: {
+      swingN: SMC_SWING_N, breakMode: SMC_BREAK_MODE, fakeBosAtrMult: SMC_FAKEBOS_ATR_MULT,
+      genSweepLookback: SMC_GEN_SWEEP_LOOKBACK, genMaxWaitBars: SMC_GEN_MAX_WAIT_BARS,
+    },
+    audit: auditReport,
+    counts: countsTotal,
+    trades: allTrades,
+  }
+  await writeFile(SMC_GEN_TRADES_PATH, JSON.stringify(out), 'utf8')
+
+  console.log(`\n=== SMC-GEN lookahead audit ===`)
+  console.log(`(a) window checks: ${audit.windowChecks - audit.windowViolations}/${audit.windowChecks} ok`)
+  console.log(`(b) outcome first-bar checks: ${audit.outcomeChecks - audit.outcomeViolations}/${audit.outcomeChecks} ok`)
+  console.log(allAssertsPass ? 'AUDIT: PASS (0 violations)' : 'AUDIT: FAIL — see output above')
+  console.log(`\nКандидатов: ${countsTotal.candidates}, заполнено: ${countsTotal.filled}, инвалидировано: ${countsTotal.cancelledInvalidated}, истекло: ${countsTotal.cancelledExpired}, не разрешилось: ${countsTotal.unresolved}`)
+  console.log(`Закрытых сделок: ${allTrades.length}. Записано в ${SMC_GEN_TRADES_PATH}`)
+}
+
 // ── P0-6: eval ──
 function mean(xs) { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0 }
 function quantile(sorted, q) {
@@ -979,13 +1161,18 @@ async function runEval() {
 
 async function main() {
   if (flag('pull')) return runPull()
-  // --smc=refine — единственное, за счёт чего расходится путь --replay; без флага (или с
-  // любым другим значением) поведение --replay бит-в-бит прежнее (P0-1/§3 инвариант 1).
-  if (flag('replay')) return flag('smc') === 'refine' ? runReplaySmc() : runReplay()
+  // --smc=refine|generate — единственное, за счёт чего расходится путь --replay; без флага
+  // (или с любым другим значением) поведение --replay бит-в-бит прежнее (P0-1/§3 инвариант 1).
+  if (flag('replay')) {
+    const smcMode = flag('smc')
+    if (smcMode === 'refine') return runReplaySmc()
+    if (smcMode === 'generate') return runReplaySmcGen()
+    return runReplay()
+  }
   if (flag('eval')) return runEval()
   console.log('Usage: node scripts/backtest.mjs --pull|--replay|--eval [options]')
   console.log('  --pull [--years=3]')
-  console.log('  --replay [--horizons=scalp,mid,long,veryLong] [--smc=refine]')
+  console.log('  --replay [--horizons=scalp,mid,long,veryLong] [--smc=refine|generate]')
   console.log('  --eval [--fill=close|next-open|both]')
 }
 

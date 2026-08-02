@@ -11,6 +11,15 @@
 // (см. SMC_ENGINE_SPEC.md §6.0 — у источника нет единого детерминированного определения
 // свинг-точки, отсюда и тюнинг ниже вынесен в env-параметры, которые харнесс свипает).
 
+// Импорты чистых функций/констант — НЕ нарушают P0-1: indicators.mjs не делает IO вообще,
+// а gen-signals.mjs делает fetch/readFile только ВНУТРИ main() (за isEntryPoint-гардом) —
+// импорт модуля исполняет лишь его top-level const/function объявления, сети не трогает.
+// Нужны здесь для smcGenerate() (потребитель B, §6.3): одни и те же пороги отбраковки
+// (MIN_TARGET_PCT/RR_MIN/SCALP_RISK_PCT_MAX), иначе сравнение потока B с v3-focus было бы
+// нечестным (спека §6.3 «Отбраковка»), и atr() для отчётного поля — без переизобретения ATR.
+import { atr } from './indicators.mjs'
+import { MIN_TARGET_PCT, RR_MIN, SCALP_RISK_PCT_MAX } from './gen-signals.mjs'
+
 // ── тюнимые параметры (см. SMC_ENGINE_SPEC.md §6.0/§6.1) ──
 
 // Размер фрактала свинг-точки: 3 или 5 свечей. У автора нет единого правила (визуальная
@@ -48,6 +57,19 @@ export const SMC_DEFER_EXPIRY_BARS = Number(process.env.SMC_DEFER_EXPIRY_BARS_OV
 // Допуск синхронизации свингов между активами для SMT-дивергенции (мс) [вывод] — автор
 // требует «синхронизированные по времени» свинги, но не даёт числового окна допуска.
 export const SMC_SMT_TOLERANCE_MS = Number(process.env.SMC_SMT_TOLERANCE_MS_OVERRIDE) || 3 * 3600 * 1000
+
+// Глубина поиска свипа для ГЕНЕРАТОРА (потребитель B, §6.3 п.4) — отдельный параметр от
+// SMC_SWEEP_LOOKBACK рефайнера (тот ищет «свип недавно перед уже готовым v3-focus сигналом»,
+// этот — «свип, с которого вообще начинается собственный сетап генератора»; разные роли,
+// разная вероятная оптимальная величина, спека называет его отдельным именем явно).
+export const SMC_GEN_SWEEP_LOOKBACK = Number(process.env.SMC_GEN_SWEEP_LOOKBACK_OVERRIDE) || 20
+
+// TTL отложенного лимитника генератора (баров сигнального ТФ), модель заполнения та же,
+// что в §4 (инвалидация раньше заполнения) [вывод: числового значения источник не даёт нигде
+// в спеке для генератора; дефолт взят тем же порядком величины, что и SMC_DEFER_EXPIRY_BARS
+// рефайнера — тот же практический смысл «сколько баров реально ждать откат», без придумывания
+// нового обоснования там, где спека прямо говорит «сколько ждёт заполнения»].
+export const SMC_GEN_MAX_WAIT_BARS = Number(process.env.SMC_GEN_MAX_WAIT_BARS_OVERRIDE) || 8
 
 // Абляция гейтов рефайнера (диагностика, не часть спеки): по умолчанию все три ветоспособных
 // гейта из §6.2 активны («2,3,4»). Любое подмножество можно выключить харнессом, чтобы
@@ -607,7 +629,10 @@ export function smtDivergence(altCandles, btcCandles, opts = {}) {
 // направления, в котором зона обычно ретестируется СРАЗУ после формирования, — это не
 // обязательно совпадает с тем, как её будет проходить цена намного позже и, возможно,
 // с другой стороны; см. отчёт агента по этому пункту).
-function findTargetMagnet(side, price, fvgZones, str) {
+// Экспортирована — переиспользуется smcGenerate() (потребитель B, §6.3 п.2): тот же
+// критерий «незакрытый FVG или неснятый пул ликвидности впереди цены», один код, два
+// потребителя. Поведение функции не меняется, только видимость.
+export function findTargetMagnet(side, price, fvgZones, str) {
   if (side === 'long') {
     const cand = fvgZones.filter((z) => z.state !== 'filled' && z.lo > price).sort((a, b) => a.lo - b.lo)[0]
     if (cand) return { kind: 'fvg', level: cand.hi, zone: cand }
@@ -655,12 +680,15 @@ export function findFreshPOI(side, price, obZones, brZones, mtZones, candles) {
 
 // Гейт 4: свип значимого уровня перед входом — берём ближайший (по времени) свинг
 // противоположного типа (для лонга — свинг-лоу, для шорта — свинг-хай) и проверяем sweep().
-function findPreEntrySweep(side, candles, n) {
+// `lookback` — параметр (не завязан на SMC_SWEEP_LOOKBACK жёстко), чтобы smcGenerate() мог
+// передать свой SMC_GEN_SWEEP_LOOKBACK (§6.3 п.4); без 4-го аргумента поведение прежнего
+// единственного вызывающего (smcRefine, гейт 4 рефайнера) бит-в-бит не меняется.
+function findPreEntrySweep(side, candles, n, lookback = SMC_SWEEP_LOOKBACK) {
   const sw = swings(candles, n)
   const type = side === 'long' ? 'low' : 'high'
   const target = sw.filter((s) => s.type === type).sort((a, b) => b.idx - a.idx)[0]
   if (!target) return null
-  const ev = sweep(candles, target.price, { lookback: SMC_SWEEP_LOOKBACK })
+  const ev = sweep(candles, target.price, { lookback })
   if (!ev || ev.dir !== type) return null
   return ev
 }
@@ -786,4 +814,243 @@ export function smcRefine(signal, ctx) {
   const pending = buildPending(side, poi, magnet, signal)
   const smcScore = scoreOf({ magnet, poi, sweptLevel: null, improved: false })
   return { action: 'defer', reasonCodes, pending, smcScore }
+}
+
+// ── smcGenerate — потребитель B (самостоятельный поток, §6.3) ──
+
+// Локальное округление для вывода уровней — копия round() из gen-signals.mjs (не импортируем
+// саму функцию: она не экспортирована там, и множить точки связи между модулями ради одного
+// маленького хелпера форматирования не стоит; риска рассинхронизации нет — это чистое
+// форматирование, не влияет ни на один расчёт).
+function round(n) {
+  if (n == null) return null
+  if (n >= 1000) return +n.toFixed(2)
+  if (n >= 1) return +n.toFixed(4)
+  if (n >= 0.01) return +n.toFixed(6)
+  return +n.toPrecision(4)
+}
+
+// Шаг 6 (§6.3): «импульсная нога слома оставляет FVG или ордер-блок». FVG-ветка ищет ТУ ЖЕ
+// трёхсвечную зону, что уже проверил fake-BOS-фильтр structure()/classifyFakeBos через
+// fvgAfter (окно [breakIdx-1, breakIdx+2) по глобальным индексам) — при bos.trueBreak===true
+// такая зона гарантированно существовала В МОМЕНТ слома (fvg() — чистая локальная проверка
+// по тройке свечей, результат не зависит от того, режется ли массив или берётся целиком).
+// К моменту T она могла успеть полностью закрыться (z.state==='filled') — тогда откатывать
+// уже некуда, и это законный повод пропустить её и уйти в OB-фолбэк, а не искусственно
+// держаться за протухшую зону.
+function findBreakZone(side, bosIdx, fvgZones, obZones) {
+  const wantSide = side === 'long' ? 'bullish' : 'bearish'
+  const fvgZone = fvgZones.find(
+    (z) => z.type === 'fvg' && z.side === wantSide && z.startIdx === bosIdx - 1 && z.endIdx === bosIdx + 1 && z.state !== 'filled',
+  )
+  if (fvgZone) return { kind: 'fvg', zone: fvgZone }
+  // Фолбэк — ордер-блок той же стороны, сформированный не позже слома (манипулятивная свеча —
+  // часть той же импульсной ноги или предшествует ей вплотную) и ещё не инвалидированный.
+  // [вывод] Не требуем «зона ранее не протестирована» (findFreshPOI рефайнера, §6.2 гейт 3):
+  // тот критерий определён через «текущая цена ВНУТРИ зоны», что для генератора неприменимо
+  // по конструкции — здесь зона всегда ищется ВПЕРЕДИ цены, ещё не достигнута. Практического
+  // риска мало: FVG-ветка выше почти всегда закрывает случай (fvgAfter — часть гейта trueBreak
+  // самого шага 5), OB — редкий резервный путь.
+  const obCandidates = obZones
+    .filter((z) => z.side === wantSide && !z.invalidated && z.idx <= bosIdx)
+    .sort((a, b) => b.idx - a.idx)
+  if (obCandidates.length) return { kind: 'ob', zone: obCandidates[0] }
+  return null
+}
+
+// Ближний край зоны — уровень лимитника (то, чего цена достигает ПЕРВЫМ при откате). Для FVG
+// это уже посчитанный entryLevel (см. makeFvgZone — самосогласованная трактовка «начала» зоны,
+// §6.1). Для OB такого поля нет — берём тот же геометрический край, что и buildPending
+// рефайнера (§6.2): для лонга ближний край снизу — верх зоны (hi), для шорта — низ (lo).
+function zoneNearEdge(side, zone) {
+  if (zone.entryLevel != null) return zone.entryLevel
+  return side === 'long' ? zone.hi : zone.lo
+}
+
+// Кэш биаса шага 1 (память процесса, НЕ файл/сеть — не нарушает P0-1). Чисто перф-мера:
+// sigTf тикает чаще, чем меняется trendTf-окно (для scalp 1ч сигнал / 4ч тренд — 4 тика на
+// одно и то же окно, для mid 4ч/1д — 6), а structure() на 330-свечном окне — самая дорогая
+// операция шага 1 (обход всех свинг-точек с посвинговым сканом слома). Ключ — последняя
+// свеча trend-окна (её ct), которая ОДНОЗНАЧНО определяет содержимое окна: windowEndingAt —
+// чистая функция от (массив, лимит, T), а массив/лимит для данного symbol+horizon неизменны
+// весь прогон. Одинаковый ключ ⇒ гарантированно одинаковый sigStr.bos на входе — эквивалентно
+// пересчёту заново, просто без повторной работы. НЕ мемоизирует ничего из sigCandles — те
+// меняются каждый тик по определению, кэш только для дорогого, но редко меняющегося тренда.
+const _trendBiasCache = new Map()
+function trendBiasCached(symbol, horizon, trendCandles, n, mode) {
+  if (!trendCandles.length) return null
+  const lastCt = trendCandles[trendCandles.length - 1].ct
+  const key = `${symbol}|${horizon}|${n}|${mode}|${lastCt}`
+  if (_trendBiasCache.has(key)) return _trendBiasCache.get(key)
+  const trendStr = structure(trendCandles, { n, mode })
+  // [вывод] structure().bos отсортирован по индексу СВИНГА, породившего слом (points идёт по
+  // idx свинг-точки), а НЕ по индексу самого слома (brk.idx) — если более ранний свинг ломается
+  // позже более позднего, bos[bos.length-1] был бы не последним ПО ВРЕМЕНИ событием. Поэтому
+  // здесь явно ищем максимум по .idx (индекс свечи слома), а не берём str.lastBOS как есть.
+  // structure() не трогаем — это отдельная, отдельно протестированная особенность её
+  // собственного поля lastBOS, менять её ради одного потребителя не входит в задачу.
+  const result = trendStr.bos.length ? trendStr.bos.reduce((a, b) => (b.idx > a.idx ? b : a)) : null
+  _trendBiasCache.set(key, result)
+  return result
+}
+
+// Генератор: самостоятельный поиск сигналов по SMC, без опоры на v3-focus (§2 «поток B»,
+// §6.3). Восемь шагов источника переложены на движок как ОБЯЗАТЕЛЬНЫЕ гейты — ранний return
+// на любом означает «сигнала нет», а не «сигнал похуже». В отличие от smcRefine() входного
+// сигнала нет вовсе: сторону, вход, стоп и цель выводит сам этот потребитель из структуры.
+//
+// Порядок ВЫЧИСЛЕНИЯ ниже — не порядок НУМЕРАЦИИ спеки: шаги 1/3/4 (биас, локация, свип)
+// используют только swings()/dealingRange()/sweep() — на 330-свечном окне на порядок дешевле,
+// чем шаг 2 (fvg()+structure() на sigCandles, нужны и шагу 5). Шаги 2-8 — независимые гейты
+// (ни один не читает результат другого до момента, когда оба уже вычислены), поэтому смена
+// порядка ВЫЧИСЛЕНИЯ не меняет ни множество сигналов, ни их уровни — только то, сколько
+// кандидатов долетают до дорогой части. На полной вселенной (top-100, 5 лет, часовой сигнал
+// скальпа) это отличие между единицами и десятками минут бэктеста; итоговый reasonCodes
+// всё равно перечисляет гейты в порядке §6.3 (1→8), а не в порядке фактического вычисления.
+//
+// ctx: { symbol, base, horizon, timeframe, sigCandles, trendCandles,
+//        swingN?, breakMode?, sweepLookback?, maxWaitBars? }
+// sigCandles/trendCandles — окна ct<=T, тот же контракт, что и smcRefine.ctx.sigCandles:
+// обрезает вызывающая сторона (backtest.mjs), здесь ничего не дообрезаем и не смотрим вперёд
+// ни на шаг — все проверки идут по уже переданному окну, без чтения candles[i] c ct>T.
+export function smcGenerate(ctx) {
+  const { symbol, base, horizon, timeframe, sigCandles, trendCandles } = ctx
+  const n = ctx.swingN ?? SMC_SWING_N
+  const mode = ctx.breakMode ?? SMC_BREAK_MODE
+  const sweepLookback = ctx.sweepLookback ?? SMC_GEN_SWEEP_LOOKBACK
+  const maxWaitBars = ctx.maxWaitBars ?? SMC_GEN_MAX_WAIT_BARS
+
+  if (!sigCandles || sigCandles.length < 60 || !trendCandles || !trendCandles.length) return null
+
+  // Шаг 1 — биас старшего ТФ ПО СТРУКТУРЕ, не по EMA (§6.3 п.1 — принципиальное отличие от
+  // v3-focus, который берёт биас из EMA50/200). Нужен ХРОНОЛОГИЧЕСКИ последний BOS (см.
+  // trendBiasCached — детали инференса и кэш вычисления вынесены туда).
+  const lastBos = trendBiasCached(symbol, horizon, trendCandles, n, mode)
+  if (!lastBos) return null
+  const side = lastBos.swingType === 'high' ? 'long' : 'short'
+
+  const price = sigCandles[sigCandles.length - 1].c
+
+  // Шаг 3 (вычислен здесь, до дорогого шага 2 — см. комментарий о порядке выше) — локация:
+  // цена в дискаунте для лонга / премиуме для шорта дилинг-рейнджа. Равновесие
+  // (zone==='equilibrium') не засчитывается ни в ту, ни в другую сторону — спека говорит
+  // «дискаунт для лонга, премиум для шорта», без промежуточного случая.
+  const range = dealingRange(sigCandles, { n })
+  if (!range) return null
+  const pd = premiumDiscount(price, range)
+  const wantZone = side === 'long' ? 'discount' : 'premium'
+  if (pd.zone !== wantZone) return null
+
+  // Шаг 4 (тоже вычислен до шага 2) — свип свинг-уровня ПРОТИВ направления сделки в пределах
+  // SMC_GEN_SWEEP_LOOKBACK свечей (для лонга: прокол свинг-лоу тенью с возвратом закрытия
+  // выше). Переиспользуем findPreEntrySweep рефайнера (тот же гейт 4, §6.2), но со своим
+  // окном поиска — спека называет параметр по имени отдельно от SMC_SWEEP_LOOKBACK
+  // рефайнера (§6.3 п.4).
+  const sweepEvent = findPreEntrySweep(side, sigCandles, n, sweepLookback)
+  if (!sweepEvent) return null
+
+  // Шаг 5 (вычислен здесь, ДО дорогого fvg() шага 2 — см. комментарий о порядке выше функции):
+  // слом ПОСЛЕ свипа, в сторону сделки, с фильтром ложного слома (импульс/ATR и образованный
+  // FVG уже посчитаны ЛОКАЛЬНО внутри structure()/classifyFakeBos на 3-свечном окне — это НЕ
+  // fvg(sigCandles) целиком, дешевле). trueBreak===true требует ОБА условия разом. «Свип
+  // обязан предшествовать слому» — то же условие, что отличает брейкер от митигейшн-блока,
+  // §6.1/§6.3 п.5. На реальных данных это САМЫЙ строгий гейт из восьми (в разы селективнее
+  // магнита из шага 2, который почти никогда не отклоняет) — проверяем его раньше, чтобы не
+  // платить за fvg(sigCandles) (единственный вызов с O(m²) BPR-подсчётом внутри примитива)
+  // на кандидатах, которые всё равно отсеются здесь.
+  // [вывод] Из нескольких подтверждённых сломов после свипа берём ПЕРВЫЙ по времени — это
+  // буквальное «свип → слом» нарратива источника (следующий шаг последовательности, не любой
+  // случайный более поздний слом в русле уже состоявшегося тренда). Числовой критерий выбора
+  // источник не даёт вовсе, но порядок шагов в §6.3 недвусмыслен.
+  const sigStr = structure(sigCandles, { n, mode })
+  const wantBreakType = side === 'long' ? 'high' : 'low'
+  const breakCands = sigStr.bos
+    .filter((b) => b.swingType === wantBreakType && b.idx > sweepEvent.idx && b.trueBreak === true)
+    .sort((a, b) => a.idx - b.idx)
+  const confirmBos = breakCands[0]
+  if (!confirmBos) return null
+
+  // Шаг 2 — цель-магнит впереди цены (тот же критерий, что и гейт 2 рефайнера, §6.2/§6.3
+  // п.2 — один код, два потребителя). Нет магнита — нет сделки; уровень магнита сразу же
+  // фиксируется как тейк (шаг 8 — это и есть magnet.level, отдельного вычисления не требует).
+  const fvgZones = fvg(sigCandles)
+  const magnet = findTargetMagnet(side, price, fvgZones, sigStr)
+  if (!magnet) return null
+
+  // Шаг 6 — зона входа: импульсная нога слома оставляет FVG (предпочтительно) либо, фолбэком,
+  // ордер-блок той же стороны. Ничего не нашлось — сигнала нет: входить по рынку вслед за
+  // импульсом означало бы повторить структурную ошибку рефайнера (§6.3, преамбула раздела).
+  // orderBlocks() считается ЛЕНИВО — только если FVG-ветка не нашла зону (дешёвая экономия:
+  // FVG почти всегда есть при trueBreak===true, см. findBreakZone).
+  const fvgHit = findBreakZone(side, confirmBos.idx, fvgZones, [])
+  const zoneHit = fvgHit || findBreakZone(side, confirmBos.idx, fvgZones, orderBlocks(sigCandles))
+  if (!zoneHit) return null
+  const entry = zoneNearEdge(side, zoneHit.zone)
+
+  // reasonCodes собираются здесь, ПОСЛЕ того как все гейты уже пройдены — фиксируем их в
+  // порядке НУМЕРАЦИИ спеки (1→8), а не в порядке фактического вычисления (см. комментарий
+  // о порядке выше функции). Кандидат уже точно валиден на этом месте по гейтам 1-6.
+  const reasonCodes = [
+    `bias:${side}(trend-bos@${lastBos.idx})`,
+    `gate2:magnet-${magnet.kind}@${magnet.level}`,
+    `gate3:${pd.zone}`,
+    `gate4:swept@${sweepEvent.idx}`,
+    `gate5:bos@${confirmBos.idx}(impulseAtr=${confirmBos.impulseAtr})`,
+    `gate6:zone-${zoneHit.kind}@${entry}`,
+  ]
+
+  // Шаг 7 — стоп ЗА экстремумом свипа, НЕ за край зоны («свип и есть точка, ниже которой
+  // сетап недействителен», §6.3 п.7). Экстремум свипа уже посчитан на шаге 4 — sweepEvent.price
+  // это цена тени, снявшей ликвидность (см. sweep()).
+  const sl = sweepEvent.price
+  // Шаг 8 — тейк = уровень магнита из шага 2.
+  const tp = magnet.level
+
+  // Валидность геометрии до расчёта riskPct/targetPct: экстремум свипа, найденный шагом 4,
+  // и зона входа, найденная шагом 6, формировались независимыми сканами — в вырожденном
+  // случае (напр. очень свежий свип позже сформированной зоны) знаки могли не сойтись.
+  // Отбрасываем такую комбинацию явно, а не даём riskPct/targetPct уйти в отрицательные —
+  // это не «сигнал похуже», это признак несовместимой геометрии, сигнала тут нет.
+  const validLong = side === 'long' && sl < entry && entry < tp
+  const validShort = side === 'short' && sl > entry && entry > tp
+  if (!validLong && !validShort) return null
+
+  const riskPct = +((Math.abs(entry - sl) / entry) * 100).toFixed(6)
+  const targetPct = +((Math.abs(tp - entry) / entry) * 100).toFixed(6)
+  if (!(riskPct > 0)) return null
+  const rr = +(targetPct / riskPct).toFixed(3)
+
+  // Отбраковка теми же порогами, что у v3-focus (§6.3 «Отбраковка») — иначе сравнение потока
+  // B с базой было бы нечестным: генератор проходил бы то, что база бы сама отсеяла.
+  if (targetPct < MIN_TARGET_PCT) return null
+  if (rr < RR_MIN) return null
+  if (horizon === 'scalp' && riskPct > SCALP_RISK_PCT_MAX) return null
+
+  const closes = sigCandles.map((k) => k.c)
+  const highs = sigCandles.map((k) => k.h)
+  const lows = sigCandles.map((k) => k.l)
+  const atrVal = atr(highs, lows, closes, 14)
+
+  return {
+    symbol,
+    base,
+    side,
+    horizon,
+    timeframe,
+    entry: round(entry),
+    sl: round(sl),
+    tp: round(tp),
+    rr,
+    riskPct,
+    targetPct,
+    atr: round(atrVal),
+    reasonCodes,
+    // Отложенный лимитник (модель §4, «Дополнительно» §6.3): вход не рыночный — ждём отката
+    // к ближнему краю зоны. invalidate===sl: если цена проходит стоп РАНЬШЕ, чем лимитник
+    // заполнился, сетап уже недействителен по построению (стоп это и есть «ниже свипа
+    // недействительно», шаг 7) — тот же смысл, что invalidate===sl в buildPending рефайнера,
+    // и та же консервативная договорённость §4: инвалидация внутри бара проверяется раньше
+    // заполнения (scanPendingFill в backtest.mjs реализует это заново, здесь не дублируем).
+    pending: { limit: round(entry), invalidate: round(sl), expiryBars: maxWaitBars },
+  }
 }
